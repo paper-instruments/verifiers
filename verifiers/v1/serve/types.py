@@ -38,6 +38,16 @@ class InfoResponse(BaseResponse):
     """Whether tasks must be run and resumed as whole groups."""
 
 
+class CancelRequest(BaseRequest):
+    method: ClassVar[str] = "cancel"
+    target_request_id: str
+
+
+class CancelResponse(BaseResponse):
+    cancelled: bool = False
+    """Whether the target was still running when the server handled cancellation."""
+
+
 class RunRolloutRequest(BaseRequest):
     method: ClassVar[str] = "run_rollout"
     task_idx: int = Field(ge=0)
@@ -68,7 +78,5 @@ class RunGroupResponse(BaseResponse):
     traces: list[Trace[WireTaskData]] | None = None
 
     @field_serializer("traces")
-    def _ser_traces(
-        self, traces: "list[Trace[WireTaskData]] | None"
-    ) -> list[dict] | None:
+    def _ser_traces(self, traces: "list[Trace[WireTaskData]] | None") -> list[dict] | None:
         return [t.model_dump() for t in traces] if traces is not None else None

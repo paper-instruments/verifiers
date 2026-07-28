@@ -16,6 +16,8 @@ from verifiers.v1.decorators import discover_decorated
 from verifiers.v1.env import EnvConfig, Environment
 from verifiers.v1.serve.types import (
     BaseResponse,
+    CancelRequest,
+    CancelResponse,
     HealthResponse,
     InfoResponse,
     RunGroupRequest,
@@ -24,6 +26,7 @@ from verifiers.v1.serve.types import (
     RunRolloutResponse,
 )
 from verifiers.v1.types import SamplingConfig
+from verifiers.v1.utils.aio import run_shielded
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +57,9 @@ class EnvServer:
         # One task type per taskset (the authoring contract; its `load()` constructs it),
         # so group scoring is a run-wide property.
         first = self._task(0) if self.num_tasks != 0 else None
-        self.requires_group_scoring = first is not None and bool(
-            discover_decorated(first, "group_reward")
-        )
-        self._clients: dict[
-            tuple[str, str], Client
-        ] = {}  # (client_config, model) -> Client
+        self.requires_group_scoring = first is not None and bool(discover_decorated(first, "group_reward"))
+        self._clients: dict[tuple[str, str], Client] = {}  # (client_config, model) -> Client
+        self._request_tasks: dict[tuple[bytes, bytes], asyncio.Task[None]] = {}
 
         self.ctx = zmq.asyncio.Context()
         self.frontend = self.ctx.socket(zmq.ROUTER)
@@ -97,15 +97,11 @@ class EnvServer:
         and exhaust memory instead of failing the one request."""
         while len(self._tasks) <= idx:
             if idx >= MAX_LAZY_TASKS:
-                raise IndexError(
-                    f"task_idx {idx} exceeds the lazy-generation cap ({MAX_LAZY_TASKS})"
-                )
+                raise IndexError(f"task_idx {idx} exceeds the lazy-generation cap ({MAX_LAZY_TASKS})")
             try:
                 self._tasks.append(next(self._task_iter))
             except StopIteration:
-                raise IndexError(
-                    f"task_idx {idx} out of range ({len(self._tasks)} tasks)"
-                ) from None
+                raise IndexError(f"task_idx {idx} out of range ({len(self._tasks)} tasks)") from None
         return self._tasks[idx]
 
     def _client(self, client_config: ClientConfig, model: str) -> Client:
@@ -115,12 +111,8 @@ class EnvServer:
             self._clients[key] = resolve_client(client_config)
         return self._clients[key]
 
-    def _context(
-        self, client_config: ClientConfig, model: str, sampling: SamplingConfig
-    ) -> ModelContext:
-        return ModelContext(
-            client=self._client(client_config, model), model=model, sampling=sampling
-        )
+    def _context(self, client_config: ClientConfig, model: str, sampling: SamplingConfig) -> ModelContext:
+        return ModelContext(client=self._client(client_config, model), model=model, sampling=sampling)
 
     def serving(self):
         """Context for the server's eval-level serving resources (shared tool servers +
@@ -143,9 +135,36 @@ class EnvServer:
         # Avoid a dump-and-validate copy for every trusted trace in the group.
         return RunGroupResponse.model_construct(traces=traces)
 
-    async def _handle(
-        self, client_id: bytes, request_id: bytes, method: bytes, payload: bytes
-    ) -> None:
+    async def _cancel(self, client_id: bytes, req: CancelRequest) -> CancelResponse:
+        task = self._request_tasks.get((client_id, req.target_request_id.encode()))
+        if task is None:
+            return CancelResponse(cancelled=False)
+        running = not task.done()
+        if running and not task.cancelling():
+            task.cancel()
+        if running:
+            await asyncio.wait((task,))
+        return CancelResponse(cancelled=running)
+
+    def _discard_request_task(self, key: tuple[bytes, bytes], task: asyncio.Task[None]) -> None:
+        if self._request_tasks.get(key) is task:
+            del self._request_tasks[key]
+
+    async def _shutdown(self, tasks: tuple[asyncio.Task, ...]) -> None:
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._request_tasks.clear()
+        for client in self._clients.values():
+            with contextlib.suppress(Exception):
+                await client.close()
+        self.frontend.close()
+        self.ctx.term()
+        logger.info("EnvServer down: taskset=%s", self.taskset_id)
+
+    async def _handle(self, client_id: bytes, request_id: bytes, method: bytes, payload: bytes) -> None:
         try:
             route = method.decode()
             raw = msgpack.unpackb(payload, raw=False)
@@ -156,19 +175,15 @@ class EnvServer:
                     num_tasks=self.num_tasks,
                     requires_group_scoring=self.requires_group_scoring,
                 )
+            elif route == "cancel":
+                response = await self._cancel(client_id, CancelRequest.model_validate(raw))
             elif route == "run_rollout":
-                response = await self._run_rollout(
-                    RunRolloutRequest.model_validate(raw)
-                )
+                response = await self._run_rollout(RunRolloutRequest.model_validate(raw))
             elif route == "run_group":
                 response = await self._run_group(RunGroupRequest.model_validate(raw))
             else:
-                response = BaseResponse(
-                    success=False, error=f"unknown method {route!r}"
-                )
-        except (
-            Exception
-        ) as e:  # a failed request is data, not a crash — report and keep serving
+                response = BaseResponse(success=False, error=f"unknown method {route!r}")
+        except Exception as e:  # a failed request is data, not a crash — report and keep serving
             logger.warning("request failed: %s", e, exc_info=True)
             response = BaseResponse(success=False, error=f"{type(e).__name__}: {e}")
         data = msgpack.packb(
@@ -178,9 +193,7 @@ class EnvServer:
         )
         try:
             # Let ZMQ retain the packed response instead of copying large traces.
-            await self.frontend.send_multipart(
-                [client_id, request_id, data], copy=False
-            )
+            await self.frontend.send_multipart([client_id, request_id, data], copy=False)
         except zmq.ZMQError as e:
             logger.warning("failed to send response: %s", e)
 
@@ -207,27 +220,21 @@ class EnvServer:
                         continue
                     frames = await self.frontend.recv_multipart()
                     if len(frames) != 4:
-                        logger.warning(
-                            "invalid message: expected 4 frames, got %d", len(frames)
-                        )
+                        logger.warning("invalid message: expected 4 frames, got %d", len(frames))
                         continue
                     client_id, request_id, method, payload = frames
-                    task = asyncio.create_task(
-                        self._handle(client_id, request_id, method, payload)
-                    )
+                    task = asyncio.create_task(self._handle(client_id, request_id, method, payload))
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
+                    if method in (b"run_rollout", b"run_group"):
+                        key = (client_id, request_id)
+                        self._request_tasks[key] = task
+                        task.add_done_callback(lambda done, key=key: self._discard_request_task(key, done))
             except (asyncio.CancelledError, KeyboardInterrupt):
                 pass
             finally:
-                for task in tasks:
-                    task.cancel()
-                for client in self._clients.values():
-                    with contextlib.suppress(Exception):
-                        await client.close()
-                self.frontend.close()
-                self.ctx.term()
-                logger.info("EnvServer down: taskset=%s", self.taskset_id)
+                with contextlib.suppress(asyncio.CancelledError):
+                    await run_shielded(self._shutdown(tuple(tasks)))
 
 
 def _make_environment(

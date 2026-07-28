@@ -39,7 +39,13 @@ import zmq.asyncio
 
 from verifiers.v1.env import EnvConfig
 from verifiers.v1.serve.server import EnvServer
-from verifiers.v1.serve.types import HealthResponse, RunGroupRequest
+from verifiers.v1.serve.types import (
+    BaseResponse,
+    CancelRequest,
+    CancelResponse,
+    HealthResponse,
+    RunGroupRequest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +109,8 @@ class EnvServerPool:
         self._mpctx = mp.get_context("spawn")
         self._poller: zmq.asyncio.Poller | None = None
         self._closed = False
+        self.pending: dict[bytes, dict] = {}
+        self.in_flight = 0
 
         self.ctx = zmq.asyncio.Context()
         self.frontend = self.ctx.socket(zmq.ROUTER)
@@ -210,9 +218,86 @@ class EnvServerPool:
     def _cap_str(self) -> str:
         return "inf" if self.max_workers is None else str(self.max_workers)
 
+    async def _send_response(self, client_id: bytes, request_id: bytes, response: BaseResponse) -> None:
+        data = msgpack.packb(response.model_dump(mode="json"), use_bin_type=True)
+        with contextlib.suppress(zmq.ZMQError):
+            await self.frontend.send_multipart([client_id, request_id, data])
+
+    def _release(self, request_id: bytes) -> dict | None:
+        entry = self.pending.pop(request_id, None)
+        if entry is None:
+            return None
+        entry["worker"]["active"] -= entry["rollout_slots"]
+        self.in_flight -= entry["rollout_slots"]
+        return entry
+
+    async def _on_cancel(self, client_id: bytes, request_id: bytes, payload: bytes) -> None:
+        try:
+            request = CancelRequest.model_validate(msgpack.unpackb(payload, raw=False))
+        except Exception as e:
+            await self._send_response(
+                client_id,
+                request_id,
+                CancelResponse(success=False, error=f"{type(e).__name__}: {e}"),
+            )
+            return
+        target_request_id = request.target_request_id.encode()
+        target = self.pending.get(target_request_id)
+        if target is None or target["client_id"] != client_id or not target["cancellable"]:
+            await self._send_response(client_id, request_id, CancelResponse(cancelled=False))
+            return
+        worker = target["worker"]
+        self.pending[request_id] = {
+            "client_id": client_id,
+            "worker": worker,
+            "rollout_slots": 0,
+            "cancellable": False,
+            "target_request_id": target_request_id,
+        }
+        await worker["dealer"].send_multipart([request_id, CancelRequest.method.encode(), payload])
+
+    async def _on_request(self, client_id: bytes, request_id: bytes, method: bytes, payload: bytes) -> None:
+        if method == b"health":
+            await self.frontend.send_multipart([client_id, request_id, _HEALTH])
+            return
+        if method == b"cancel":
+            await self._on_cancel(client_id, request_id, payload)
+            return
+        # Pool capacity is measured in rollouts; one group request carries n.
+        rollout_slots = 1
+        if method == b"run_group":
+            with contextlib.suppress(Exception):
+                request = RunGroupRequest.model_validate(msgpack.unpackb(payload, raw=False))
+                rollout_slots = max(1, request.n)
+        worker = min(self.workers, key=lambda w: w["active"])
+        worker["active"] += rollout_slots
+        self.pending[request_id] = {
+            "client_id": client_id,
+            "worker": worker,
+            "rollout_slots": rollout_slots,
+            "cancellable": method in (b"run_rollout", b"run_group"),
+        }
+        self.in_flight += rollout_slots
+        # forward without client_id — the DEALER identity is the worker's
+        # `client_id`; we hold the real one in `pending`.
+        await worker["dealer"].send_multipart([request_id, method, payload])
+        if self.elastic:
+            self._maybe_scale_up(self.in_flight)
+
+    async def _on_reply(self, worker: dict) -> None:
+        request_id, data = await worker["dealer"].recv_multipart(copy=False)
+        request_id_bytes = request_id.bytes
+        entry = self.pending.get(request_id_bytes)
+        if entry is None or entry["worker"] is not worker:
+            return
+        entry = self._release(request_id_bytes)
+        target_request_id = entry.get("target_request_id")
+        if target_request_id is not None:
+            self._release(target_request_id)
+        with contextlib.suppress(zmq.ZMQError):
+            await self.frontend.send_multipart([entry["client_id"], request_id, data], copy=False)
+
     async def run(self) -> None:
-        # request_id -> {client_id, worker, rollout_slots}
-        pending: dict[bytes, dict] = {}
         try:
             self.start()
             self._poller = zmq.asyncio.Poller()
@@ -227,7 +312,6 @@ class EnvServerPool:
                 self.multiplex,
                 self.elastic,
             )
-            in_flight = 0
             while True:
                 events = dict(await self._poller.poll())
                 if self.frontend in events:
@@ -237,47 +321,10 @@ class EnvServerPool:
                         method,
                         payload,
                     ) = await self.frontend.recv_multipart()
-                    if method == b"health":
-                        await self.frontend.send_multipart(
-                            [client_id, request_id, _HEALTH]
-                        )
-                    else:
-                        # Pool capacity is measured in rollouts; one group request carries n.
-                        rollout_slots = 1
-                        if method == b"run_group":
-                            with contextlib.suppress(Exception):
-                                request = RunGroupRequest.model_validate(
-                                    msgpack.unpackb(payload, raw=False)
-                                )
-                                rollout_slots = max(1, request.n)
-                        worker = min(self.workers, key=lambda w: w["active"])
-                        worker["active"] += rollout_slots
-                        pending[request_id] = {
-                            "client_id": client_id,
-                            "worker": worker,
-                            "rollout_slots": rollout_slots,
-                        }
-                        in_flight += rollout_slots
-                        # forward without client_id — the DEALER identity is the worker's
-                        # `client_id`; we hold the real one in `pending`.
-                        await worker["dealer"].send_multipart(
-                            [request_id, method, payload]
-                        )
-                        if self.elastic:
-                            self._maybe_scale_up(in_flight)
+                    await self._on_request(client_id, request_id, method, payload)
                 for w in self.workers:
                     if w["dealer"] in events:
-                        request_id, data = await w["dealer"].recv_multipart(copy=False)
-                        # Copy only the routing key; relay the response Frames unchanged.
-                        entry = pending.pop(request_id.bytes, None)
-                        if entry is None:
-                            continue
-                        entry["worker"]["active"] -= entry["rollout_slots"]
-                        in_flight -= entry["rollout_slots"]
-                        with contextlib.suppress(zmq.ZMQError):
-                            await self.frontend.send_multipart(
-                                [entry["client_id"], request_id, data], copy=False
-                            )
+                        await self._on_reply(w)
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
@@ -364,9 +411,7 @@ def serve_env(
         log_setup()
     try:
         if max_workers is None or max_workers > 1:
-            if (
-                "config" in server_kwargs
-            ):  # dict-ify for the workers (config_data is picklable)
+            if "config" in server_kwargs:  # dict-ify for the workers (config_data is picklable)
                 config = server_kwargs.pop("config")
                 server_kwargs["config_data"] = env_config_data(config)
             pool = EnvServerPool(
@@ -385,15 +430,11 @@ def serve_env(
         else:
             from verifiers.v1.legacy import LegacyEnvServer
 
-            if (
-                "config_data" in server_kwargs
-            ):  # rebuild the env config for an in-process server
+            if "config_data" in server_kwargs:  # rebuild the env config for an in-process server
                 config_data = server_kwargs.pop("config_data")
                 server_kwargs["config"] = EnvConfig.model_validate(config_data)
             cls = LegacyEnvServer if legacy else EnvServer
-            cls.run_server(
-                address=address, address_queue=address_queue, **server_kwargs
-            )
+            cls.run_server(address=address, address_queue=address_queue, **server_kwargs)
     except KeyboardInterrupt:
         pass
     except Exception:

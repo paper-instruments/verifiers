@@ -23,6 +23,8 @@ from verifiers.v1.clients.config import ClientConfig
 from verifiers.v1.serve.types import (
     BaseRequest,
     BaseResponse,
+    CancelRequest,
+    CancelResponse,
     HealthRequest,
     HealthResponse,
     InfoRequest,
@@ -73,6 +75,7 @@ class EnvClient:
         request: BaseRequest,
         response_type: type[ResponseT],
         timeout: float | None = None,
+        cancel_remote: bool = False,
     ) -> ResponseT:
         """Send a typed request and validate the reply into `response_type`. A
         `timeout` is only used for health polling — rollouts run untimed."""
@@ -81,73 +84,76 @@ class EnvClient:
         future: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         payload = msgpack.packb(request.model_dump(mode="json"), use_bin_type=True)
-        await self.socket.send_multipart(
-            [request_id.encode(), request.method.encode(), payload]
-        )
         try:
+            await self.socket.send_multipart([request_id.encode(), request.method.encode(), payload])
             data = await asyncio.wait_for(future, timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError:
             self._pending.pop(request_id, None)
             raise
-        if response_type in (HealthResponse, InfoResponse):
+        except asyncio.CancelledError:
+            self._pending.pop(request_id, None)
+            if cancel_remote:
+                await self._wait_for_remote_cancel(request_id)
+            raise
+        if response_type in (CancelResponse, HealthResponse, InfoResponse):
             response = response_type.model_validate(msgpack.unpackb(data, raw=False))
         else:
             # Keep large trace replies compact on the loop and expand only one at a time.
             await self._decode_slots.acquire()
             decoding = asyncio.create_task(
-                asyncio.to_thread(
-                    lambda: response_type.model_validate(
-                        msgpack.unpackb(data, raw=False)
-                    )
-                )
+                asyncio.to_thread(lambda: response_type.model_validate(msgpack.unpackb(data, raw=False)))
             )
             # Hold the slot until the worker finishes so cancellation cannot overlap decodes.
             decoding.add_done_callback(lambda _: self._decode_slots.release())
             try:
                 response = await asyncio.shield(decoding)
             except asyncio.CancelledError:
-                decoding.add_done_callback(
-                    lambda task: None if task.cancelled() else task.exception()
-                )
+                decoding.add_done_callback(lambda task: None if task.cancelled() else task.exception())
                 raise
         if not response.success:
             raise RuntimeError(response.error or "env server request failed")
         return response
 
+    async def _wait_for_remote_cancel(self, request_id: str) -> None:
+        cancellation = asyncio.create_task(self.cancel(request_id))
+        while not cancellation.done():
+            try:
+                await asyncio.shield(cancellation)
+            except asyncio.CancelledError:
+                continue
+        cancellation.result()
+
     async def health(self, timeout: float = 2.0) -> bool:
         try:
-            return (
-                await self._request(HealthRequest(), HealthResponse, timeout=timeout)
-            ).success
+            return (await self._request(HealthRequest(), HealthResponse, timeout=timeout)).success
         except asyncio.TimeoutError:
             return False
 
-    async def wait_for_server_startup(
-        self, timeout: float = 120.0, interval: float = 1.0
-    ) -> None:
+    async def wait_for_server_startup(self, timeout: float = 120.0, interval: float = 1.0) -> None:
         """Poll `health` until the server answers or `timeout` elapses."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if await self.health(timeout=min(interval, 2.0)):
                 return
             await asyncio.sleep(interval)
-        raise TimeoutError(
-            f"env server at {self.address} did not become healthy in {timeout}s"
-        )
+        raise TimeoutError(f"env server at {self.address} did not become healthy in {timeout}s")
 
     async def info(self) -> InfoResponse:
         """Return the taskset `num_tasks` + whether its tasks group-score."""
         return await self._request(InfoRequest(), InfoResponse)
+
+    async def cancel(self, target_request_id: str) -> CancelResponse:
+        """Cancel one request and return after its remote cleanup has finished."""
+        return await self._request(CancelRequest(target_request_id=target_request_id), CancelResponse)
 
     async def run_rollout(
         self, task_idx: int, client: ClientConfig, model: str, sampling: SamplingConfig
     ) -> Trace[WireTaskData]:
         """Run one rollout for `task_idx`; return a typed `Trace[WireTaskData]`."""
         response = await self._request(
-            RunRolloutRequest(
-                task_idx=task_idx, client=client, model=model, sampling=sampling
-            ),
+            RunRolloutRequest(task_idx=task_idx, client=client, model=model, sampling=sampling),
             RunRolloutResponse,
+            cancel_remote=True,
         )
         return response.trace
 
@@ -161,10 +167,9 @@ class EnvClient:
     ) -> list[Trace[WireTaskData]]:
         """Run `n` rollouts for `task_idx` as a scored group; return typed `Trace[WireTaskData]`s."""
         response = await self._request(
-            RunGroupRequest(
-                task_idx=task_idx, n=n, client=client, model=model, sampling=sampling
-            ),
+            RunGroupRequest(task_idx=task_idx, n=n, client=client, model=model, sampling=sampling),
             RunGroupResponse,
+            cancel_remote=True,
         )
         return response.traces
 

@@ -26,8 +26,10 @@ import contextlib
 import logging
 import multiprocessing as mp
 import os
+import queue
 import signal
 import threading
+import time
 import uuid
 from collections.abc import Callable
 
@@ -42,6 +44,7 @@ from verifiers.v1.serve.types import HealthResponse, RunGroupRequest
 logger = logging.getLogger(__name__)
 
 _HEALTH = msgpack.packb(HealthResponse().model_dump(mode="json"), use_bin_type=True)
+_WORKER_STARTUP_TIMEOUT = 600.0
 
 
 def _arm_teardown(death_pipe=None) -> None:
@@ -99,6 +102,7 @@ class EnvServerPool:
         self.workers: list[dict] = []
         self._mpctx = mp.get_context("spawn")
         self._poller: zmq.asyncio.Poller | None = None
+        self._closed = False
 
         self.ctx = zmq.asyncio.Context()
         self.frontend = self.ctx.socket(zmq.ROUTER)
@@ -112,15 +116,17 @@ class EnvServerPool:
     def _worker_path(self, i: int) -> str:
         return f"/tmp/vf-pool-{self.session}-{i}"
 
-    def _spawn_worker(self) -> None:
+    def _spawn_worker(self, *, report_startup: bool = False) -> dict:
         i = len(self.workers)  # upscale-only, so the next index is the current count
         address = f"ipc://{self._worker_path(i)}"
         parent_conn, child_conn = self._mpctx.Pipe()
+        address_queue = self._mpctx.Queue() if report_startup else None
         proc = self._mpctx.Process(
             target=serve_env,
             kwargs=dict(
                 max_workers=1,
                 address=address,
+                address_queue=address_queue,
                 death_pipe=child_conn,
                 legacy=self.legacy,
                 log_setup=self.log_setup,
@@ -133,17 +139,55 @@ class EnvServerPool:
         dealer = self.ctx.socket(zmq.DEALER)
         dealer.setsockopt(zmq.LINGER, 0)
         dealer.connect(address)  # connect before bind is fine — ZMQ queues
-        self.workers.append(
-            {
-                "process": proc,
-                "dealer": dealer,
-                "pipe": parent_conn,
-                "active": 0,
-                "index": i,
-            }
-        )
+        worker = {
+            "process": proc,
+            "dealer": dealer,
+            "pipe": parent_conn,
+            "active": 0,
+            "index": i,
+            "startup_queue": address_queue,
+        }
+        self.workers.append(worker)
         if self._poller is not None:
             self._poller.register(dealer, zmq.POLLIN)
+        return worker
+
+    def _wait_for_worker(self, worker: dict) -> None:
+        process = worker["process"]
+        address_queue = worker["startup_queue"]
+        if address_queue is None:
+            raise RuntimeError("worker startup was not requested")
+        deadline = time.monotonic() + _WORKER_STARTUP_TIMEOUT
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"environment worker did not start within {_WORKER_STARTUP_TIMEOUT}s")
+                try:
+                    address_queue.get(timeout=min(0.1, remaining))
+                    return
+                except queue.Empty:
+                    if not process.is_alive():
+                        process.join()
+                        raise RuntimeError(f"environment worker failed during startup (exit code {process.exitcode})")
+        finally:
+            address_queue.close()
+            address_queue.join_thread()
+            worker["startup_queue"] = None
+
+    def start(self) -> None:
+        """Construct the initial worker set before the broker reports readiness."""
+        if self.workers:
+            return
+        try:
+            workers = [
+                self._spawn_worker(report_startup=True) for _ in range(1 if self.elastic else (self.max_workers or 1))
+            ]
+            for worker in workers:
+                self._wait_for_worker(worker)
+        except Exception:
+            self._shutdown()
+            raise
 
     def _maybe_scale_up(self, in_flight: int) -> None:
         """Spawn one more worker when in-flight rollout slots reach 90% of capacity.
@@ -167,23 +211,22 @@ class EnvServerPool:
         return "inf" if self.max_workers is None else str(self.max_workers)
 
     async def run(self) -> None:
-        self._poller = zmq.asyncio.Poller()
-        self._poller.register(self.frontend, zmq.POLLIN)
-        # Elastic: start with one and scale up on demand. Otherwise pre-spawn the lot
-        # (`max_workers` is a concrete count when elastic is off).
-        for _ in range(1 if self.elastic else (self.max_workers or 1)):
-            self._spawn_worker()
         # request_id -> {client_id, worker, rollout_slots}
         pending: dict[bytes, dict] = {}
-        logger.info(
-            "EnvServerPool up: address=%s workers=%d/%s multiplex=%d elastic=%s",
-            self.address,
-            len(self.workers),
-            self._cap_str,
-            self.multiplex,
-            self.elastic,
-        )
         try:
+            self.start()
+            self._poller = zmq.asyncio.Poller()
+            self._poller.register(self.frontend, zmq.POLLIN)
+            for worker in self.workers:
+                self._poller.register(worker["dealer"], zmq.POLLIN)
+            logger.info(
+                "EnvServerPool up: address=%s workers=%d/%s multiplex=%d elastic=%s",
+                self.address,
+                len(self.workers),
+                self._cap_str,
+                self.multiplex,
+                self.elastic,
+            )
             in_flight = 0
             while True:
                 events = dict(await self._poller.poll())
@@ -241,7 +284,16 @@ class EnvServerPool:
             self._shutdown()
 
     def _shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         for w in self.workers:
+            startup_queue = w["startup_queue"]
+            if startup_queue is not None:
+                with contextlib.suppress(Exception):
+                    startup_queue.close()
+                with contextlib.suppress(Exception):
+                    startup_queue.join_thread()
             with contextlib.suppress(Exception):
                 w["pipe"].close()
             with contextlib.suppress(Exception):
@@ -252,6 +304,8 @@ class EnvServerPool:
             if w["process"].is_alive():
                 with contextlib.suppress(Exception):
                     w["process"].kill()
+                with contextlib.suppress(Exception):
+                    w["process"].join()
             with contextlib.suppress(Exception):
                 w["dealer"].close()
             with contextlib.suppress(OSError):
@@ -313,9 +367,8 @@ def serve_env(
             if (
                 "config" in server_kwargs
             ):  # dict-ify for the workers (config_data is picklable)
-                server_kwargs = {
-                    "config_data": env_config_data(server_kwargs["config"])
-                }
+                config = server_kwargs.pop("config")
+                server_kwargs["config_data"] = env_config_data(config)
             pool = EnvServerPool(
                 server_kwargs,
                 max_workers,
@@ -325,6 +378,7 @@ def serve_env(
                 multiplex,
                 elastic,
             )
+            pool.start()
             if address_queue is not None:
                 address_queue.put(pool.address)
             asyncio.run(pool.run())
@@ -334,9 +388,8 @@ def serve_env(
             if (
                 "config_data" in server_kwargs
             ):  # rebuild the env config for an in-process server
-                server_kwargs = {
-                    "config": EnvConfig.model_validate(server_kwargs["config_data"])
-                }
+                config_data = server_kwargs.pop("config_data")
+                server_kwargs["config"] = EnvConfig.model_validate(config_data)
             cls = LegacyEnvServer if legacy else EnvServer
             cls.run_server(
                 address=address, address_queue=address_queue, **server_kwargs

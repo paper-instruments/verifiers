@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import importlib
 import logging
 
 import msgpack
@@ -32,11 +33,15 @@ MAX_LAZY_TASKS = 1_000_000
 
 class EnvServer:
     def __init__(
-        self, config: EnvConfig, address: str = "tcp://127.0.0.1:5000"
+        self,
+        config: EnvConfig | None = None,
+        address: str = "tcp://127.0.0.1:5000",
+        factory_path: str | None = None,
+        factory_kwargs: dict | None = None,
     ) -> None:
         self.address = address
-        self.taskset_id = config.taskset.id
-        self.env = Environment(config)
+        self.env = _make_environment(config, factory_path, factory_kwargs)
+        self.taskset_id = self.env.taskset.config.id
         # A finite taskset is materialized up front (its count is served via `info`); an
         # infinite one is pulled off its generator on demand (see `_task`), so
         # `num_tasks=None` on the wire ⟺ the taskset is infinite.
@@ -75,10 +80,8 @@ class EnvServer:
         # semaphore (resource_tracker warning at shutdown).
         use_threading_tqdm_lock()
         server = cls(**kwargs)
-        if address_queue is not None:
-            address_queue.put(server.address)
         try:
-            asyncio.run(server.run())
+            asyncio.run(server.run(address_queue=address_queue))
         except KeyboardInterrupt:
             # SIGTERM arrives as KeyboardInterrupt (see serve.pool._arm_teardown) so the event
             # loop runs its cleanup finallys; swallow it for a clean spawned-worker exit instead
@@ -181,7 +184,7 @@ class EnvServer:
         except zmq.ZMQError as e:
             logger.warning("failed to send response: %s", e)
 
-    async def run(self) -> None:
+    async def run(self, address_queue=None) -> None:
         logger.info(
             "EnvServer up: taskset=%s address=%s tasks=%s group_scoring=%s",
             self.taskset_id,
@@ -194,6 +197,9 @@ class EnvServer:
         tasks: set[asyncio.Task] = set()
         # Shared servers and the interception live across requests in this worker.
         async with self.serving():
+            # Readiness includes successful initialization of those shared resources.
+            if address_queue is not None:
+                address_queue.put(self.address)
             try:
                 while True:
                     events = dict(await poller.poll(timeout=100))
@@ -222,3 +228,31 @@ class EnvServer:
                 self.frontend.close()
                 self.ctx.term()
                 logger.info("EnvServer down: taskset=%s", self.taskset_id)
+
+
+def _make_environment(
+    config: EnvConfig | None,
+    factory_path: str | None,
+    factory_kwargs: dict | None,
+) -> Environment:
+    if factory_path is None:
+        if factory_kwargs is not None:
+            raise ValueError("factory_kwargs requires factory_path")
+        if config is None:
+            raise ValueError("config is required when factory_path is not set")
+        return Environment(config)
+    if config is not None:
+        raise ValueError("config and factory_path are mutually exclusive")
+
+    module_name, separator, attribute_name = factory_path.rpartition(".")
+    if not separator or not module_name or not attribute_name:
+        raise ValueError(f"factory_path must be a dotted import path, got {factory_path!r}")
+    factory = getattr(importlib.import_module(module_name), attribute_name)
+    if not callable(factory):
+        raise TypeError(f"environment factory {factory_path!r} is not callable")
+    environment = factory(**(factory_kwargs or {}))
+    if not isinstance(environment, Environment):
+        raise TypeError(
+            f"environment factory {factory_path!r} returned {type(environment).__name__}, expected Environment"
+        )
+    return environment

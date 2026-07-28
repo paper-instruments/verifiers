@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+from types import SimpleNamespace
 
 import msgpack
 import pytest
@@ -23,11 +24,22 @@ class CancellationState:
         self.cleanup_started = asyncio.Event()
         self.cleanup_allowed = asyncio.Event()
         self.cleaned = asyncio.Event()
+        self.finalized: list[tuple[object, BaseException]] = []
 
 
 class BlockingEpisode:
-    def __init__(self, state: CancellationState) -> None:
+    def __init__(self, state: CancellationState, n: int) -> None:
         self.state = state
+        harness = SimpleNamespace(
+            finalize_interrupted_trace=self._finalize_interrupted_trace,
+        )
+        self.rollouts = [
+            SimpleNamespace(
+                trace=SimpleNamespace(id=f"trace-{index}"),
+                harness=harness,
+            )
+            for index in range(n)
+        ]
 
     async def run(self):
         self.state.started.set()
@@ -37,6 +49,14 @@ class BlockingEpisode:
             self.state.cleanup_started.set()
             await self.state.cleanup_allowed.wait()
             self.state.cleaned.set()
+
+    def _finalize_interrupted_trace(
+        self,
+        trace: object,
+        error: BaseException,
+    ) -> None:
+        assert self.state.cleaned.is_set()
+        self.state.finalized.append((trace, error))
 
 
 @pytest.mark.parametrize("method", ["run_rollout", "run_group"])
@@ -57,6 +77,10 @@ async def test_client_cancellation_waits_for_remote_episode_cleanup(method):
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(request_task, 2)
         assert state.cleaned.is_set()
+        expected_traces = 2 if method == "run_group" else 1
+        assert len(state.finalized) == expected_traces
+        assert len({id(error) for _, error in state.finalized}) == 1
+        assert isinstance(state.finalized[0][1], asyncio.CancelledError)
         assert client._pending == {}
         assert server._request_tasks == {}
     finally:
@@ -246,7 +270,7 @@ def _blocking_server(state: CancellationState) -> EnvServer:
         address="tcp://127.0.0.1:0",
     )
     server._context = lambda *args: None
-    server.env.episode = lambda *args, **kwargs: BlockingEpisode(state)
+    server.env.episode = lambda *args, n=1, **kwargs: BlockingEpisode(state, n)
 
     @contextlib.asynccontextmanager
     async def serving():

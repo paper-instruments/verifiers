@@ -14,6 +14,7 @@ from verifiers.v1.clients.client import Client
 from verifiers.v1.clients.config import ClientConfig
 from verifiers.v1.decorators import discover_decorated
 from verifiers.v1.env import EnvConfig, Environment
+from verifiers.v1.episode import Episode
 from verifiers.v1.serve.types import (
     BaseResponse,
     CancelRequest,
@@ -25,6 +26,7 @@ from verifiers.v1.serve.types import (
     RunRolloutRequest,
     RunRolloutResponse,
 )
+from verifiers.v1.trace import Trace
 from verifiers.v1.types import SamplingConfig
 from verifiers.v1.utils.aio import run_shielded
 
@@ -124,14 +126,14 @@ class EnvServer:
     async def _run_rollout(self, req: RunRolloutRequest) -> RunRolloutResponse:
         ctx = self._context(req.client, req.model, req.sampling)
         episode = self.env.episode(self._task(req.task_idx), ctx, n=1)
-        traces = await episode.run()
+        traces = await _run_episode(episode)
         # Trust the concrete trace; serialize it once before client-side re-typing.
         return RunRolloutResponse.model_construct(trace=traces[0])
 
     async def _run_group(self, req: RunGroupRequest) -> RunGroupResponse:
         ctx = self._context(req.client, req.model, req.sampling)
         episode = self.env.episode(self._task(req.task_idx), ctx, n=req.n)
-        traces = await episode.run()
+        traces = await _run_episode(episode)
         # Avoid a dump-and-validate copy for every trusted trace in the group.
         return RunGroupResponse.model_construct(traces=traces)
 
@@ -263,3 +265,29 @@ def _make_environment(
             f"environment factory {factory_path!r} returned {type(environment).__name__}, expected Environment"
         )
     return environment
+
+
+async def _run_episode(episode: Episode) -> list[Trace]:
+    try:
+        return await episode.run()
+    except asyncio.CancelledError as error:
+        for rollout in episode.rollouts:
+            trace = rollout.trace
+            finalize = getattr(
+                rollout.harness,
+                "finalize_interrupted_trace",
+                None,
+            )
+            if trace is None or finalize is None:
+                continue
+            try:
+                finalize(trace, error)
+            except BaseException:
+                # Cleanup telemetry must not replace the cancellation that owns
+                # the rollout and its runtime teardown.
+                logger.warning(
+                    "failed to finalize interrupted rollout %s",
+                    trace.id,
+                    exc_info=True,
+                )
+        raise

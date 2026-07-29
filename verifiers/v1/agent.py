@@ -414,10 +414,10 @@ class Agent:
                 if run.ok:
                     run.trace.stop("agent_completed")
             trace = await run.close()
-        except BaseException as error:
+        except BaseException:
             # A cancellation mid-run (or a lifetime bug raised to the caller) means
             # close() never runs — free the run's servers and owned runtime first.
-            await run.abort(error)
+            await run.abort()
             raise
         if trace.runtime is not None:
             trace.runtime.borrowed = runtime is not None
@@ -478,16 +478,12 @@ class Agent:
             **params,
         )
         interaction = Interaction(run, gate=self._gate)
-        try:
-            async with self._gate or nullcontext():
-                opened = await run.open()
-                if not opened:
-                    trace = await run.close()
-                    if trace.runtime is not None:
-                        trace.runtime.borrowed = runtime is not None
-        except BaseException as error:
-            await run.abort(error)
-            raise
+        async with self._gate or nullcontext():
+            opened = await run.open()
+            if not opened:
+                trace = await run.close()
+                if trace.runtime is not None:
+                    trace.runtime.borrowed = runtime is not None
         if not opened:
             failure = run.failure
             if failure is None:  # `open()` returning False always captures one.
@@ -498,15 +494,11 @@ class Agent:
         except Exception as e:
             run.fail(e)
             raise
-        except BaseException as error:
-            await run.abort(error)
+        except BaseException:
+            await run.abort()
             raise
         finally:
-            try:
-                trace = run.trace if run.closed else await interaction.close()
-            except BaseException as error:
-                await run.abort(error)
-                raise
+            trace = run.trace if run.closed else await interaction.close()
             if trace.runtime is not None:
                 trace.runtime.borrowed = runtime is not None
 

@@ -26,7 +26,6 @@ from verifiers.v1.serve.types import (
 )
 from verifiers.v1.task import Task, task_data_cls
 from verifiers.v1.types import SamplingConfig
-from verifiers.v1.utils.aio import run_shielded
 
 logger = logging.getLogger(__name__)
 
@@ -157,20 +156,6 @@ class EnvServer:
         if self._request_tasks.get(key) is task:
             del self._request_tasks[key]
 
-    async def _shutdown(self, tasks: tuple[asyncio.Task, ...]) -> None:
-        for task in tasks:
-            if not task.done() and not task.cancelling():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._request_tasks.clear()
-        for client in self._clients.values():
-            with contextlib.suppress(Exception):
-                await client.close()
-        self.frontend.close()
-        self.ctx.term()
-        logger.info("EnvServer down: taskset=%s", self.taskset_id)
-
     async def _handle(
         self, client_id: bytes, request_id: bytes, method: bytes, payload: bytes
     ) -> None:
@@ -253,5 +238,11 @@ class EnvServer:
             except (asyncio.CancelledError, KeyboardInterrupt):
                 pass
             finally:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await run_shielded(self._shutdown(tuple(tasks)))
+                for task in tasks:
+                    task.cancel()
+                for client in self._clients.values():
+                    with contextlib.suppress(Exception):
+                        await client.close()
+                self.frontend.close()
+                self.ctx.term()
+                logger.info("EnvServer down: taskset=%s", self.taskset_id)

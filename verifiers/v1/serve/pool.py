@@ -105,8 +105,8 @@ class EnvServerPool:
         self.workers: list[dict] = []
         self._mpctx = mp.get_context("spawn")
         self._poller: zmq.asyncio.Poller | None = None
-        self.pending: dict[bytes, dict] = {}
-        self.in_flight = 0
+        self._pending: dict[bytes, dict] = {}
+        self._in_flight = 0
 
         self.ctx = zmq.asyncio.Context()
         self.frontend = self.ctx.socket(zmq.ROUTER)
@@ -185,11 +185,11 @@ class EnvServerPool:
             await self.frontend.send_multipart([client_id, request_id, data])
 
     def _release(self, request_id: bytes) -> dict | None:
-        entry = self.pending.pop(request_id, None)
+        entry = self._pending.pop(request_id, None)
         if entry is None:
             return None
         entry["worker"]["active"] -= entry["rollout_slots"]
-        self.in_flight -= entry["rollout_slots"]
+        self._in_flight -= entry["rollout_slots"]
         return entry
 
     async def _on_cancel(
@@ -205,7 +205,7 @@ class EnvServerPool:
             )
             return
         target_request_id = request.target_request_id.encode()
-        target = self.pending.get(target_request_id)
+        target = self._pending.get(target_request_id)
         if (
             target is None
             or target["client_id"] != client_id
@@ -216,7 +216,7 @@ class EnvServerPool:
             )
             return
         worker = target["worker"]
-        self.pending[request_id] = {
+        self._pending[request_id] = {
             "client_id": client_id,
             "worker": worker,
             "rollout_slots": 0,
@@ -250,23 +250,23 @@ class EnvServerPool:
                 rollout_slots = max(1, request.n)
         worker = min(self.workers, key=lambda w: w["active"])
         worker["active"] += rollout_slots
-        self.pending[request_id] = {
+        self._pending[request_id] = {
             "client_id": client_id,
             "worker": worker,
             "rollout_slots": rollout_slots,
             "cancellable": method in (b"run", b"run_group"),
         }
-        self.in_flight += rollout_slots
+        self._in_flight += rollout_slots
         # Forward without client_id — the DEALER identity is the worker's
         # `client_id`; we hold the real one in `pending`.
         await worker["dealer"].send_multipart([request_id, method, payload])
         if self.elastic:
-            self._maybe_scale_up(self.in_flight)
+            self._maybe_scale_up(self._in_flight)
 
     async def _on_reply(self, worker: dict) -> None:
         request_id, data = await worker["dealer"].recv_multipart(copy=False)
         request_id_bytes = request_id.bytes
-        entry = self.pending.get(request_id_bytes)
+        entry = self._pending.get(request_id_bytes)
         if entry is None or entry["worker"] is not worker:
             return
         entry = self._release(request_id_bytes)

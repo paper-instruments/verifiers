@@ -18,6 +18,7 @@ business, never this module's.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
@@ -53,7 +54,6 @@ from verifiers.v1.state import state_cls
 from verifiers.v1.task import Task, TaskData
 from verifiers.v1.trace import AgentInfo, Trace, TraceTask, VersionInfo
 from verifiers.v1.types import Messages
-from verifiers.v1.utils.aio import run_shielded
 from verifiers.v1.utils.version import verifiers_commit
 
 logger = logging.getLogger(__name__)
@@ -161,7 +161,6 @@ class RolloutRun:
         self._failure: Exception | None = None
         self._opened = False
         self._closed = False
-        self._aborted = False
         self._endpoint: str | None = None
         self._urls: dict[str, str] = {}
         self.deadline_at: float | None = None
@@ -292,11 +291,11 @@ class RolloutRun:
         except Exception as e:  # noqa: BLE001 - setup boundary records every rollout failure
             self.fail(e)
             return False
-        except BaseException as error:
+        except BaseException:
             # A cancellation mid-setup kills the driver's await with it, so no
             # caller reaches close() — free the started runtime and entered
             # servers here rather than relying on the driver's own guard.
-            await self.abort(error)
+            await self.abort()
             raise
         now = time.time()
         self.trace.timing.setup.end = now
@@ -366,55 +365,20 @@ class RolloutRun:
         # never moved, forever.
         return self.ok and trace.num_turns > turns_before
 
-    async def abort(self, error: BaseException) -> None:
+    async def abort(self) -> None:
         """Free everything this run holds — the entered servers and an owned
         runtime — without finalizing or scoring: the escape path when an exception
         (a cancellation mid-setup, a lifetime bug raised to the caller) means the
-        driver will never reach `close()`. Notify the harness after serving
-        resources close but before generic cleanup can discard lifecycle state.
-        Safe after a partial `close()` and idempotent."""
-        if self._aborted:
-            return
-        self._aborted = True
+        driver will never reach `close()`. Safe after a partial `close()`."""
         self._closed = True
-        try:
-            await run_shielded(self._abort_cleanup(error))
-        except asyncio.CancelledError:
-            pass
-        except BaseException:
-            logger.warning(
-                "rollout abort cleanup failed for %s",
-                self.trace.id,
-                exc_info=True,
-            )
-
-    async def _abort_cleanup(self, error: BaseException) -> None:
-        runtime = self.runtime
-        for label, cleanup in (
-            ("resource stack", self._stack.aclose),
-            ("harness hook", lambda: self.harness.abort(self.trace, error)),
-            (
-                "harness cleanup",
-                (lambda: self.harness.cleanup(self.trace, runtime))
-                if runtime is not None
-                else None,
-            ),
-            (
-                "runtime",
-                runtime.stop if self._owns_runtime and runtime is not None else None,
-            ),
-        ):
-            if cleanup is None:
-                continue
-            try:
-                await cleanup()
-            except BaseException:
-                logger.warning(
-                    "rollout %s abort %s failed",
-                    self.trace.id,
-                    label,
-                    exc_info=True,
-                )
+        with contextlib.suppress(Exception):
+            await self._stack.aclose()
+        if self.runtime is not None:
+            with contextlib.suppress(Exception):
+                await self.harness.cleanup(self.trace, self.runtime)
+        if self._owns_runtime and self.runtime is not None:
+            with contextlib.suppress(Exception):
+                await self.runtime.stop()
 
     async def close(self) -> Trace:
         """Finish the rollout: tool servers and interception down, task `finalize`

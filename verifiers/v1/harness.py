@@ -89,15 +89,6 @@ class Harness(ABC, Generic[ConfigT]):
     async def setup(self, runtime: Runtime) -> None:
         """Provision this harness in `runtime` before its execution timeout starts."""
 
-    async def abort(self, trace: Trace, error: BaseException) -> None:
-        """Finalize harness-owned state after a run escapes through `BaseException`.
-
-        This is the cancellation/interrupt path, after the rollout's serving
-        resources close but before generic harness and runtime cleanup. Expected
-        rollout errors and deadline timeouts follow normal finalization and scoring
-        instead.
-        """
-
     async def install_skills(self, runtime: Runtime, dest: str) -> None:
         """Upload each `config.skills` folder into `runtime` at `dest/<folder name>` —
         the program's fixed skill discovery location, which a supporting harness's

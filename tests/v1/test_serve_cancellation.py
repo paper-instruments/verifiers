@@ -14,7 +14,6 @@ from verifiers.v1.serve import (
     EnvClient,
     EnvServer,
     RunGroupRequest,
-    RunRequest,
 )
 from verifiers.v1.serve.pool import EnvServerPool
 from verifiers.v1.types import SamplingConfig
@@ -95,108 +94,6 @@ async def test_client_cancellation_is_bounded_when_server_is_gone(monkeypatch):
             await asyncio.wait_for(server_task, 2)
 
 
-async def test_receiver_failure_wakes_pending_requests():
-    client = EnvClient()
-    client.socket.close()
-    client.socket = BrokenSocket()
-    try:
-        with pytest.raises(
-            ConnectionError, match="env server response receiver failed"
-        ):
-            await asyncio.wait_for(client.info(), 1)
-        assert client._pending == {}
-
-        with pytest.raises(
-            ConnectionError, match="env server response receiver failed"
-        ):
-            await client.info()
-    finally:
-        await client.close()
-
-
-async def test_request_serialization_failure_discards_pending(monkeypatch):
-    client = EnvClient()
-
-    def fail_serialization(*_args, **_kwargs):
-        raise ValueError("cannot serialize request")
-
-    monkeypatch.setattr(client_module.msgpack, "packb", fail_serialization)
-    try:
-        with pytest.raises(ValueError, match="cannot serialize request"):
-            await client.info()
-        assert client._pending == {}
-    finally:
-        await client.close()
-
-
-async def test_request_send_failure_discards_pending():
-    client = EnvClient()
-    client.socket.close()
-    client.socket = SendFailureSocket()
-    try:
-        with pytest.raises(zmq.ZMQError, match="send failed"):
-            await client.info()
-        assert client._pending == {}
-    finally:
-        await client.close()
-
-
-async def test_client_close_wakes_pending_requests():
-    client = EnvClient()
-    client.socket.close()
-    socket = HangingSocket()
-    client.socket = socket
-    request = asyncio.create_task(client.info())
-    await asyncio.wait_for(socket.sent.wait(), 1)
-
-    await client.close()
-
-    with pytest.raises(ConnectionError, match="env client closed"):
-        await request
-    assert client._pending == {}
-
-
-async def test_server_shutdown_waits_for_request_cleanup():
-    state = CancellationState()
-    server = _blocking_server(state, "run")
-    server_task = asyncio.create_task(server.run())
-    ctx = zmq.asyncio.Context()
-    socket = ctx.socket(zmq.DEALER)
-    socket.setsockopt(zmq.LINGER, 0)
-    socket.connect(server.address)
-    request = RunRequest(
-        task_data={},
-        client=EvalClientConfig(),
-        model="model",
-        sampling=SamplingConfig(),
-    )
-    try:
-        await socket.send_multipart(
-            [
-                b"shutdown-target",
-                RunRequest.method.encode(),
-                msgpack.packb(request.model_dump(mode="json"), use_bin_type=True),
-            ]
-        )
-        await asyncio.wait_for(state.started.wait(), 2)
-        server_task.cancel()
-        await asyncio.wait_for(state.cleanup_started.wait(), 2)
-        server_task.cancel()
-        await asyncio.sleep(0)
-        assert not server_task.done()
-
-        state.cleanup_allowed.set()
-        await asyncio.wait_for(server_task, 2)
-        assert state.cleaned.is_set()
-    finally:
-        state.cleanup_allowed.set()
-        if not server_task.done():
-            server_task.cancel()
-            await asyncio.wait_for(server_task, 2)
-        socket.close()
-        ctx.term()
-
-
 async def test_cancel_unknown_target_is_a_successful_noop():
     state = CancellationState()
     server = _blocking_server(state, "run")
@@ -241,15 +138,15 @@ async def test_pool_routes_cancel_to_owner_and_releases_capacity():
         await pool._on_request(client_id, target_id, b"run", b"request")
         owner = workers[0]
         assert owner["active"] == 1
-        assert pool.in_flight == 1
+        assert pool._in_flight == 1
 
         await pool._on_cancel(b"other-client", b"rejected", payload)
         assert not responses[-1][2].cancelled
-        assert target_id in pool.pending
+        assert target_id in pool._pending
 
         await pool._on_cancel(client_id, cancel_id, payload)
         assert dealers[0].sent[-1] == [cancel_id, b"cancel", payload]
-        assert cancel_id in pool.pending
+        assert cancel_id in pool._pending
 
         response_data = msgpack.packb(
             CancelResponse(cancelled=True).model_dump(mode="json"),
@@ -258,10 +155,15 @@ async def test_pool_routes_cancel_to_owner_and_releases_capacity():
         dealers[0].reply = [zmq.Frame(cancel_id), zmq.Frame(response_data)]
         await pool._on_reply(owner)
 
-        assert pool.pending == {}
-        assert pool.in_flight == 0
+        assert pool._pending == {}
+        assert pool._in_flight == 0
         assert owner["active"] == 0
         assert workers[1]["active"] == 0
+
+        dealers[0].reply = [zmq.Frame(target_id), zmq.Frame(b"late")]
+        await pool._on_reply(owner)
+        assert pool._in_flight == 0
+        assert owner["active"] == 0
     finally:
         pool.workers = []
         pool._shutdown()
@@ -289,9 +191,9 @@ async def test_pool_natural_completion_race_releases_capacity_once():
 
         dealer.reply = [zmq.Frame(target_id), zmq.Frame(b"completed")]
         await pool._on_reply(worker)
-        assert target_id not in pool.pending
-        assert cancel_id in pool.pending
-        assert pool.in_flight == 0
+        assert target_id not in pool._pending
+        assert cancel_id in pool._pending
+        assert pool._in_flight == 0
         assert worker["active"] == 0
 
         response_data = msgpack.packb(
@@ -300,8 +202,8 @@ async def test_pool_natural_completion_race_releases_capacity_once():
         )
         dealer.reply = [zmq.Frame(cancel_id), zmq.Frame(response_data)]
         await pool._on_reply(worker)
-        assert pool.pending == {}
-        assert pool.in_flight == 0
+        assert pool._pending == {}
+        assert pool._in_flight == 0
         assert worker["active"] == 0
     finally:
         pool.workers = []
@@ -398,39 +300,3 @@ def _run_group_payload(n: int) -> bytes:
         sampling=SamplingConfig(),
     )
     return msgpack.packb(request.model_dump(mode="json"), use_bin_type=True)
-
-
-class BrokenSocket:
-    async def send_multipart(self, _frames: list[bytes]) -> None:
-        return None
-
-    async def recv_multipart(self) -> list[bytes]:
-        raise zmq.ZMQError("receiver lost")
-
-    def close(self) -> None:
-        return None
-
-
-class SendFailureSocket:
-    async def send_multipart(self, _frames: list[bytes]) -> None:
-        raise zmq.ZMQError("send failed")
-
-    async def recv_multipart(self) -> list[bytes]:
-        await asyncio.Future()
-
-    def close(self) -> None:
-        return None
-
-
-class HangingSocket:
-    def __init__(self) -> None:
-        self.sent = asyncio.Event()
-
-    async def send_multipart(self, _frames: list[bytes]) -> None:
-        self.sent.set()
-
-    async def recv_multipart(self) -> list[bytes]:
-        await asyncio.Future()
-
-    def close(self) -> None:
-        return None

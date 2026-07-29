@@ -6,13 +6,16 @@ verifiers offers built-in support for Harbor via the `HarborTaskset` class. Crea
 import verifiers.v1 as vf
 from verifiers.v1.tasksets.harbor import HarborConfig, HarborTask, HarborTaskset
 
+
 # Set the dataset to the same name as registered in the Harbor registry
 class TerminalBench2Config(HarborConfig):
     dataset: str = "terminal-bench/terminal-bench-2"
 
 
 # The data will get loaded automatically
-class TerminalBench2Taskset(HarborTaskset, vf.Taskset[HarborTask, TerminalBench2Config]):
+class TerminalBench2Taskset(
+    HarborTaskset, vf.Taskset[HarborTask, TerminalBench2Config]
+):
     pass
 ```
 
@@ -29,19 +32,27 @@ IMAGE_TEMPLATE = "registry.example.com/openthoughts/{task}:latest"
 
 
 class OpenThoughtsTBLiteConfig(HarborConfig):
-    dataset: Literal["openthoughts/openthoughts-tblite"] = "openthoughts/openthoughts-tblite"
+    dataset: Literal["openthoughts/openthoughts-tblite"] = (
+        "openthoughts/openthoughts-tblite"
+    )
     # Tell verifiers to use the pre-built image
     ignore_dockerfile: bool = True
 
 
-class OpenThoughtsTBLiteTaskset(HarborTaskset, vf.Taskset[HarborTask, OpenThoughtsTBLiteConfig]):
+class OpenThoughtsTBLiteTaskset(
+    HarborTaskset, vf.Taskset[HarborTask, OpenThoughtsTBLiteConfig]
+):
     def load(self) -> list[HarborTask]:
         # Use the public image instead to avoid building the image at runtime; the row
         # data is frozen, so rebuild each task around an updated copy.
         return [
             HarborTask(
                 task.data.model_copy(
-                    update={"image": IMAGE_TEMPLATE.format(task=Path(task.data.task_dir).name)}
+                    update={
+                        "image": IMAGE_TEMPLATE.format(
+                            task=Path(task.data.task_dir).name
+                        )
+                    }
                 ),
                 task.config,
             )
@@ -69,10 +80,31 @@ resource_multiplier = 2.0
 
 The `timeout_multiplier` multiplies both the agent and verifier timeout, while the `resource_multiplier` multiplies the task's CPU, memory and disk space. You might want to use these multipliers when the tasks set too tight limits and/or the agent is slow.
 
+## Network policies
+
+Harbor's effective agent network policy is applied to Docker or Prime VM harness
+runtimes. An `[agent].network_mode` override takes precedence over the `[environment]`
+baseline; legacy `[environment].allow_internet` is normalized by Harbor's schema.
+
+| Harbor mode | Task network policy |
+| --- | --- |
+| `public` | Sets the task allowlist to `["*"]`, leaving the evaluator policy intact. |
+| `no-network` | Sets the task allowlist to `[]` (framework routes only). |
+| `allowlist` | Sets the task allowlist to `allowed_hosts`. |
+
+Trusted task and harness setup remains online. The policy starts immediately before the
+agent and stays active through finalization and scoring. Interception and MCP URLs are
+added automatically in allowlist and framework-only modes. Concrete task/runtime
+allowlists combine, as do blocklists; framework-only access on either side takes
+precedence, and concrete allowlists cannot be combined with blocklists. Docker framework
+routes take precedence over deny rules, while ordinary Prime deny rules are applied
+unchanged and may block a matching route. Restricted Harbor tasks require Docker or a
+Prime VM; Prime accepts host-level entries.
+
 ## Shortcomings
 
 verifiers does not have parity with Harbor yet, so some features are missing and currently being worked on. The most notable missing features right now are:
 
-- `no-network` support for sandbox runtimes ([Harbor Docs](https://www.harborframework.com/docs/tasks/network-policy))
+- Switching to a different verifier-phase network policy ([Harbor Docs](https://www.harborframework.com/docs/tasks/network-policy))
 - Shared & separate verifiers ([Harbor Docs](https://www.harborframework.com/docs/tasks#verifier-environment-shared-vs-separate))
 - Multi-step tasks ([Harbor Docs](https://www.harborframework.com/docs/tasks/multi-step))

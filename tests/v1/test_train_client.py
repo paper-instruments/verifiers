@@ -14,7 +14,6 @@ def test_synthetic_tool_call_ids_are_unique_across_responses():
 
 
 def test_renderer_native_tool_call_id_is_preserved():
-    # Kimi emits this ID in sampled tokens, so Verifiers must not replace it.
     response = response_from_generate(
         _generate_result("request-a", "functions.lookup:0"),
         "model",

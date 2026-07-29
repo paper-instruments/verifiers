@@ -32,9 +32,18 @@ from datasets import Dataset
 import verifiers as vf
 
 # Create your dataset
-dataset = Dataset.from_list([
-    {"prompt": [{"role": "user", "content": "Navigate to example.com and find the main heading"}]},
-])
+dataset = Dataset.from_list(
+    [
+        {
+            "prompt": [
+                {
+                    "role": "user",
+                    "content": "Navigate to example.com and find the main heading",
+                }
+            ]
+        },
+    ]
+)
 
 # Create a rubric
 rubric = vf.Rubric(funcs=[my_reward_func])
@@ -139,7 +148,7 @@ Drop-in adapter for [OpenEnv](https://github.com/meta-pytorch/OpenEnv) environme
 
 The Verifiers adapter uses OpenEnv's public async clients. The bundled OpenEnv project under `proj/` declares its own server dependencies for the sandbox image.
 
-### Quick Start
+### OpenEnv Quick Start
 
 Initialize an OpenEnv environment with the template:
 

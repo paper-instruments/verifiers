@@ -6,11 +6,13 @@ import os
 import shutil
 import signal
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic_config import BaseConfig
 
 from verifiers.v1.runtimes.base import BaseRuntimeInfo, ProgramResult, Runtime
+
+_BACKGROUND_STOP_TIMEOUT = 5
 
 # Implicit host inheritance removes every name containing "API_KEY" while keeping
 # harmless settings such as PATH, HOME, and cache locations. The explicit `env`
@@ -28,8 +30,8 @@ class SubprocessRuntimeInfo(SubprocessConfig, BaseRuntimeInfo):
 
 class SubprocessRuntime(Runtime):
     # Share prepared script environments across the worker's per-rollout runtimes.
-    _interpreters: dict[str, str] = {}
-    _locks: dict[str, asyncio.Lock] = {}
+    _interpreters: ClassVar[dict[str, str]] = {}
+    _locks: ClassVar[dict[str, asyncio.Lock]] = {}
 
     def __init__(self, config: SubprocessConfig, name: str | None = None) -> None:
         super().__init__(name)
@@ -102,12 +104,46 @@ class SubprocessRuntime(Runtime):
         target.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(target.write_bytes, data)
 
+    @staticmethod
+    def _signal(proc: asyncio.subprocess.Process, sig: signal.Signals) -> None:
+        if proc.returncode is not None:
+            return
+        # Signal the whole group (start_new_session => pgid == pid), not just proc.pid,
+        # so a background server's children (sh -> uv -> python) stop with it.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(os.getpgid(proc.pid), sig)
+
+    async def teardown(self) -> None:
+        """Stop and reap background servers before their event loop closes."""
+        background = list(self._background)
+        for proc in background:
+            self._signal(proc, signal.SIGTERM)
+        if background:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(proc.wait() for proc in background), return_exceptions=True
+                    ),
+                    timeout=_BACKGROUND_STOP_TIMEOUT,
+                )
+            except TimeoutError:
+                for proc in background:
+                    self._signal(proc, signal.SIGKILL)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *(proc.wait() for proc in background),
+                            return_exceptions=True,
+                        ),
+                        timeout=_BACKGROUND_STOP_TIMEOUT,
+                    )
+        self._background = []
+        if self.workdir is not None:
+            await asyncio.to_thread(shutil.rmtree, self.workdir, True)
+
     def cleanup(self) -> None:
         for proc in self._background:
-            # Kill the whole group (start_new_session => pgid == pid), not just proc.pid, so a
-            # background server's children (sh -> uv -> python) are reaped too.
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            self._signal(proc, signal.SIGTERM)
         self._background = []
         if self.workdir is not None:
             shutil.rmtree(self.workdir, ignore_errors=True)

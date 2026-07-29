@@ -4,13 +4,18 @@ The static musl binary runs in Linux containers without additional runtime depen
 """
 
 import base64
+import hashlib
+import json
 import logging
 import re
 import shlex
+from collections import Counter
 
 from verifiers.v1.clients import ModelContext
-from verifiers.v1.harness import Harness, HarnessConfig
+from verifiers.v1.configs.harness import HarnessConfig
+from verifiers.v1.harness import Harness
 from verifiers.v1.runtimes import ProgramResult, Runtime
+from verifiers.v1.task import TaskData
 from verifiers.v1.trace import Trace
 from verifiers.v1.types import TextContentPart
 
@@ -23,6 +28,7 @@ KEY_VAR = "CODEX_INTERCEPT_KEY"
 
 CODEX_DIR = "/tmp/vf-codex"
 CODEX_BIN = f"{CODEX_DIR}/bin/codex"
+SKILLS_DIR = ".agents/skills"
 INSTALL = r"""
 set -e
 mkdir -p {dir}/bin
@@ -44,10 +50,12 @@ class CodexHarnessConfig(HarnessConfig):
 
 class CodexHarness(Harness[CodexHarnessConfig]):
     APPENDS_SYSTEM_PROMPT = False  # TODO
-    SUPPORTS_MCP = False  # TODO
-    SUPPORTS_MESSAGE_PROMPT = True
+    SUPPORTS_MCP = True
+    SUPPORTS_RESUME = True
+    SUPPORTS_SKILLS = True
 
     async def setup(self, runtime: Runtime) -> None:
+        await self.install_skills(runtime, SKILLS_DIR)
         logger.info("codex: ensuring codex %s is installed", self.config.version)
         script = (
             INSTALL.replace("{version}", self.config.version)
@@ -71,8 +79,9 @@ class CodexHarness(Harness[CodexHarnessConfig]):
         endpoint: str,
         secret: str,
         mcp_urls: dict[str, str],
+        data: TaskData,
     ) -> ProgramResult:
-        task = trace.task.data
+        task = data
         if (
             task.system_prompt is not None
             and task.prompt is not None
@@ -119,9 +128,115 @@ class CodexHarness(Harness[CodexHarnessConfig]):
                     image_args += ["-i", path]
                     image_index += 1
             prompt = "\n\n".join(texts)
-        # codex authenticates to the interception server with the session secret (its provider
-        # api key) and posts Responses calls to `{endpoint}/responses`.
-        env = {**self.config.resolved_env, KEY_VAR: secret}
+        argv = [
+            CODEX_BIN,
+            "exec",
+            *self._config_args(ctx, endpoint, mcp_urls),
+            *image_args,
+            "--",
+            prompt,
+        ]
+        try:
+            return await runtime.run_program(
+                argv, await self._env(trace, runtime, secret)
+            )
+        finally:
+            if image_args:
+                try:
+                    await runtime.run(["rm", "-rf", image_dir], {})
+                except Exception:
+                    # Runtime teardown is the fallback; preserve the rollout result.
+                    logger.warning(
+                        "failed to clean up Codex prompt images", exc_info=True
+                    )
+
+    async def resume(
+        self,
+        ctx: ModelContext,
+        trace: Trace,
+        runtime: Runtime,
+        endpoint: str,
+        secret: str,
+        mcp_urls: dict[str, str],
+        data: TaskData,
+        messages,
+    ) -> ProgramResult:
+        """Native continuation: `codex exec resume --last` re-opens the session the
+        previous segment recorded — codex's own context, compaction included — and
+        takes the user's next turn. Nothing is replayed into its prompt (replaying
+        our view of the conversation would fight codex's own session state, which is
+        exactly why the default relaunch-resume is wrong for it). The rollout's
+        per-trace `CODEX_HOME` (see `_env`) makes `--last` unambiguous even when a
+        borrowed runtime hosts several rollouts."""
+        texts: list[str] = []
+        for message in messages:
+            if message.role != "user":
+                raise ValueError("codex resume takes user turns only")
+            parts = (
+                [TextContentPart(text=message.content)]
+                if isinstance(message.content, str)
+                else message.content
+            )
+            for part in parts:
+                if not isinstance(part, TextContentPart):
+                    raise TypeError(
+                        "codex resume supports text user turns only (images go in "
+                        "the opening prompt)"
+                    )
+                texts.append(part.text)
+        if trace.num_turns == 0:
+            return await self.launch(
+                ctx,
+                trace,
+                runtime,
+                endpoint,
+                secret,
+                mcp_urls,
+                data.model_copy(update={"prompt": messages}),
+            )
+        argv = [
+            CODEX_BIN,
+            "exec",
+            "resume",
+            "--last",
+            *self._config_args(ctx, endpoint, mcp_urls),
+            "--",
+            "\n\n".join(texts),
+        ]
+        return await runtime.run_program(argv, await self._env(trace, runtime, secret))
+
+    async def cleanup(self, trace: Trace, runtime: Runtime) -> None:
+        home = self._home(trace)
+        result = await runtime.run(["rm", "-rf", home], {})
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"failed to clean up Codex home: {result.stderr.strip()[-500:]}"
+            )
+
+    @staticmethod
+    def _home(trace: Trace) -> str:
+        return f"/tmp/vf-codex-home-{trace.id}"
+
+    async def _env(self, trace: Trace, runtime: Runtime, secret: str) -> dict[str, str]:
+        # codex authenticates to the interception server with the session secret (its
+        # provider api key) and posts Responses calls to `{endpoint}/responses`. The
+        # per-trace CODEX_HOME scopes its recorded sessions to this rollout, so
+        # `exec resume --last` continues THIS exchange and never a neighbor's.
+        # codex refuses a home that doesn't exist, so make it before every segment.
+        home = self._home(trace)
+        await runtime.run(["mkdir", "-p", home], {})
+        return {
+            **self.config.resolved_env,
+            KEY_VAR: secret,
+            "CODEX_HOME": home,
+        }
+
+    def _config_args(
+        self,
+        ctx: ModelContext,
+        endpoint: str,
+        mcp_urls: dict[str, str],
+    ) -> list[str]:
         # Values are Codex feature names such as `shell_tool`; Codex owns validation.
         # https://developers.openai.com/codex/config-reference#features
         tool_config = [
@@ -129,11 +244,52 @@ class CodexHarness(Harness[CodexHarnessConfig]):
             for tool in self.config.disabled_tools or []
             for arg in ("--disable", tool)
         ]
+        # Set the whole table so dots in quoted server IDs are not interpreted as
+        # `-c` path separators.
+        mcp_config = (
+            [
+                "-c",
+                "mcp_servers={"
+                + ",".join(
+                    (
+                        f"{json.dumps(name, ensure_ascii=False)}="
+                        f"{{url={json.dumps(url, ensure_ascii=False)},required=true,"
+                        "startup_timeout_sec=60.0,tool_timeout_sec=600.0}"
+                    )
+                    for name, url in mcp_urls.items()
+                )
+                + "}",
+            ]
+            if mcp_urls
+            else []
+        )
+
+        # Codex keeps raw server IDs for MCP calls but normalizes the namespaces
+        # exposed to the model. Mirror rust-v0.144.5's per-character replacement,
+        # optional prefix, collision hash, and possible 49-character truncation.
+        namespace_bases: dict[str, str] = {}
+        for name in mcp_urls:
+            namespace = re.sub(r"[^a-zA-Z0-9_]", "_", name) or "_"
+            namespace_bases[name] = (
+                namespace if namespace.startswith("mcp__") else f"mcp__{namespace}"
+            )
+        namespace_counts = Counter(namespace_bases.values())
+        direct_mcp_namespaces: list[str] = []
+        for name, namespace in namespace_bases.items():
+            if namespace_counts[namespace] > 1:
+                suffix = hashlib.sha1(f"{name}\0{name}\0".encode()).hexdigest()[:12]
+                namespace = (
+                    f"{namespace[:-2]}_{suffix}__"
+                    if namespace.endswith("__")
+                    else f"{namespace}_{suffix}"
+                )
+            direct_mcp_namespaces.append(namespace)
+            if len(namespace) > 49:
+                direct_mcp_namespaces.append(namespace[:49])
+        direct_mcp_namespaces = list(dict.fromkeys(direct_mcp_namespaces))
         # `-c` values parse as TOML, falling back to a raw string (so the url / `responses`
         # come through literally); `requires_openai_auth=false` parses as a bool.
-        argv = [
-            CODEX_BIN,
-            "exec",
+        return [
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
             # Apps/plugins can flip on remotely and advertise definitions custom providers reject.
@@ -161,18 +317,16 @@ class CodexHarness(Harness[CodexHarnessConfig]):
             "-c",
             f"model_providers.{PROVIDER}.requires_openai_auth=false",
             *tool_config,
-            *image_args,
-            "--",
-            prompt,
+            *mcp_config,
+            *(
+                [
+                    "-c",
+                    (
+                        "features.code_mode.direct_only_tool_namespaces="
+                        f"{json.dumps(direct_mcp_namespaces)}"
+                    ),
+                ]
+                if direct_mcp_namespaces
+                else []
+            ),
         ]
-        try:
-            return await runtime.run_program(argv, env)
-        finally:
-            if image_args:
-                try:
-                    await runtime.run(["rm", "-rf", image_dir], {})
-                except Exception:
-                    # Runtime teardown is the fallback; preserve the rollout result.
-                    logger.warning(
-                        "failed to clean up Codex prompt images", exc_info=True
-                    )

@@ -25,7 +25,10 @@ SKIP_EVAL: set[str] = set()
 # Per-run caps are seat fields; recipe envs name their own seats.
 SEATS: dict[str, tuple[str, ...]] = {
     "code_golf_v1": ("golfer",),
+    "kuhn_poker_v1": ("player0", "player1"),
+    "openenv_wordle_v1": ("player",),
     "proposer_solver_v1": ("proposer", "solver"),
+    "wordle_v1": ("player",),
 }
 
 
@@ -69,7 +72,9 @@ def test_eval(taskset: str):
         "--sampling.max-tokens", "512", "--rich", "false",
     ]  # fmt: skip
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=EVAL_TIMEOUT)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=EVAL_TIMEOUT, check=False
+        )
     except subprocess.TimeoutExpired:
         pytest.fail(f"Timed out after {EVAL_TIMEOUT}s evaluating {taskset}")
     assert proc.returncode == 0, (

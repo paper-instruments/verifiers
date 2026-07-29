@@ -4,6 +4,7 @@ from pydantic import Field
 
 from verifiers.v1.runtimes.base import (
     BaseRuntimeInfo,
+    NetworkPolicyConfig,
     ProgramResult,
     Runtime,
     register,
@@ -45,30 +46,30 @@ def make_runtime(config: RuntimeConfig, name: str | None = None) -> Runtime:
 
 
 def runtime_is_local(config: RuntimeConfig) -> bool:
-    """Whether a runtime of this config shares the host network (so a program inside it reaches a
-    host service at localhost, no tunnel) — read off the runtime class, without provisioning one.
-    The interception / tool serving use it to decide whether to tunnel their host port."""
+    """Whether a runtime of this config exchanges host-local URLs without a public
+    tunnel, read off the runtime class without provisioning one."""
     return _runtime_cls(config).is_local
 
 
 __all__ = [
+    "BaseRuntimeInfo",
+    "DockerConfig",
+    "DockerRuntime",
+    "DockerRuntimeInfo",
+    "ModalConfig",
+    "ModalRuntime",
+    "ModalRuntimeInfo",
+    "NetworkPolicyConfig",
+    "PrimeConfig",
+    "PrimeRuntime",
+    "PrimeRuntimeInfo",
     "ProgramResult",
     "Runtime",
     "RuntimeConfig",
     "RuntimeInfo",
-    "BaseRuntimeInfo",
-    "make_runtime",
-    "runtime_is_local",
     "SubprocessConfig",
     "SubprocessRuntime",
     "SubprocessRuntimeInfo",
-    "DockerConfig",
-    "DockerRuntime",
-    "DockerRuntimeInfo",
-    "PrimeConfig",
-    "PrimeRuntime",
-    "PrimeRuntimeInfo",
-    "ModalConfig",
-    "ModalRuntime",
-    "ModalRuntimeInfo",
+    "make_runtime",
+    "runtime_is_local",
 ]

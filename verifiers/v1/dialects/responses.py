@@ -1,26 +1,18 @@
 """The OpenAI Responses dialect (codex and friends).
 
 Request parsing walks the `input` items, folding each run of assistant-side items (reasoning /
-assistant message / function_call) into one typed assistant message; response parsing reads the
-`output` items. Relay-only: the eval client forwards the program's bytes to a `/responses`
-endpoint and this dialect parses a copy for the trace. Server-side statefulness
+assistant message / function or custom tool call) into one typed assistant message; response
+parsing reads the `output` items. Relay-only: the eval client forwards the program's bytes to a
+`/responses` endpoint and this dialect parses a copy for the trace. Server-side statefulness
 (`previous_response_id`) is not emulated — the endpoint owns it.
 """
 
 import json
 from collections import deque
-from typing import Any, cast
 
 from openai.types.responses import (
-    EasyInputMessageParam,
-    ResponseFunctionToolCallParam,
-    ResponseInputImageParam,
-    ResponseInputMessageContentListParam,
-    ResponseInputParam,
-    ResponseInputTextParam,
     ResponseUsage,
 )
-from openai.types.responses.response_input_param import FunctionCallOutput
 from pydantic import BaseModel, ConfigDict
 
 from verifiers.v1.dialects.base import Dialect, StreamParser, iter_sse_reverse
@@ -104,60 +96,8 @@ def parse_content(content) -> str | list[ContentPart]:
     return parts
 
 
-def messages_to_wire(messages: Messages) -> ResponseInputParam:
-    items: ResponseInputParam = []
-    for message in messages:
-        if isinstance(message, AssistantMessage):
-            if message.provider_state:
-                items.extend(cast(ResponseInputParam, message.provider_state))
-                continue
-            if message.content:
-                items.append(
-                    EasyInputMessageParam(
-                        role="assistant",
-                        content=message.content,
-                    )
-                )
-            items.extend(
-                ResponseFunctionToolCallParam(
-                    type="function_call",
-                    call_id=call.id,
-                    name=call.name,
-                    arguments=call.arguments,
-                )
-                for call in message.tool_calls or []
-            )
-            continue
-        content: str | ResponseInputMessageContentListParam = (
-            message.content
-            if isinstance(message.content, str)
-            else [
-                ResponseInputTextParam(type="input_text", text=part.text)
-                if isinstance(part, TextContentPart)
-                else ResponseInputImageParam(
-                    type="input_image",
-                    image_url=part.image_url.url,
-                    detail="auto",
-                )
-                for part in message.content
-            ]
-        )
-        if isinstance(message, ToolMessage):
-            items.append(
-                FunctionCallOutput(
-                    type="function_call_output",
-                    call_id=message.tool_call_id,
-                    output=cast(Any, content),
-                )
-            )
-        else:
-            items.append(EasyInputMessageParam(role=message.role, content=content))
-    return items
-
-
 def fold_assistant(items: list[dict]) -> AssistantMessage:
-    """One run of assistant-side items (reasoning / message / function_call) -> one typed
-    assistant message."""
+    """One run of assistant-side items -> one typed assistant message."""
     content = ""
     reasoning: list[str] = []
     calls: list[ToolCall] = []
@@ -165,12 +105,12 @@ def fold_assistant(items: list[dict]) -> AssistantMessage:
         if item.get("type") == "reasoning":
             reasoning += [s.get("text", "") for s in item.get("summary") or []]
             reasoning += [c.get("text", "") for c in item.get("content") or []]
-        elif item.get("type") == "function_call":
+        elif item.get("type") in ("function_call", "custom_tool_call"):
             calls.append(
                 ToolCall(
                     id=item.get("call_id", ""),
                     name=item.get("name", ""),
-                    arguments=item.get("arguments", ""),
+                    arguments=item.get("arguments", item.get("input", "")),
                 )
             )
         else:  # an assistant message item
@@ -210,12 +150,12 @@ def response_from_wire(response: OpenAIResponse) -> Response:
         elif kind == "reasoning":
             reasoning += [s.get("text", "") for s in item.get("summary") or []]
             reasoning += [c.get("text", "") for c in item.get("content") or []]
-        elif kind == "function_call":
+        elif kind in ("function_call", "custom_tool_call"):
             calls.append(
                 ToolCall(
                     id=item.get("call_id", ""),
                     name=item.get("name", ""),
-                    arguments=item.get("arguments", ""),
+                    arguments=item.get("arguments", item.get("input", "")),
                 )
             )
     tool_calls = calls or None
@@ -338,7 +278,10 @@ class ResponsesDialect(Dialect[dict, OpenAIResponse]):
                 run = []
             if assistant:
                 run.append(item)
-            elif item.get("type") == "function_call_output":
+            elif item.get("type") in (
+                "function_call_output",
+                "custom_tool_call_output",
+            ):
                 output = item.get("output")
                 content = (
                     parse_content(output)
@@ -412,16 +355,3 @@ class ResponsesDialect(Dialect[dict, OpenAIResponse]):
             if k not in _SAMPLING_KEYS and k not in overrides
         }
         return {**steered, **overrides}
-
-    def extend(
-        self, body: dict, completion: dict | None, user_messages: Messages
-    ) -> dict:
-        raw = body.get("input")
-        items: ResponseInputParam = (
-            [EasyInputMessageParam(role="user", content=raw)]
-            if isinstance(raw, str)
-            else cast(ResponseInputParam, list(raw or []))
-        )
-        items.extend(cast(ResponseInputParam, (completion or {}).get("output") or []))
-        items.extend(messages_to_wire(user_messages))
-        return {**body, "input": items}

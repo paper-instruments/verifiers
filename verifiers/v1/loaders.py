@@ -4,27 +4,30 @@ import contextvars
 import importlib
 import importlib.util
 import pkgutil
+from collections.abc import Callable
 from types import ModuleType
-from typing import Callable
 
 from pydantic import ValidationError
 from pydantic_config import BaseConfig
 
-from verifiers.v1.env import EnvConfig, Env
-from verifiers.v1.utils.generic import prefix_validation_error
+from verifiers.v1.configs.env import EnvConfig
+from verifiers.v1.configs.harness import HarnessConfig
+from verifiers.v1.configs.judge import JudgeConfig
+from verifiers.v1.configs.taskset import TasksetConfig
+from verifiers.v1.env import Env
 from verifiers.v1.envs.single_agent import SingleAgentEnv
-from verifiers.v1.harness import Harness, HarnessConfig
-from verifiers.v1.judge import Judge, JudgeConfig, judge_config_cls
-from verifiers.v1.utils.install import ensure_installed
-from verifiers.v1.utils.generic import generic_type
+from verifiers.v1.harness import Harness
+from verifiers.v1.judge import Judge, judge_config_cls
 from verifiers.v1.task import Task
-from verifiers.v1.taskset import Taskset, TasksetConfig
+from verifiers.v1.taskset import Taskset
+from verifiers.v1.utils.generic import generic_type, prefix_validation_error
+from verifiers.v1.utils.install import ensure_installed
 
 
 def builtin_harness_ids() -> list[str]:
     """The harness ids that ship with verifiers (the `verifiers.v1.harnesses`
     subpackages)."""
-    import verifiers.v1.harnesses as harnesses
+    from verifiers.v1 import harnesses
 
     return sorted(m.name for m in pkgutil.iter_modules(harnesses.__path__))
 
@@ -55,7 +58,7 @@ def narrow_plugin_field(
             if field == "harness"
             else ""
         )
-        raise ValueError(
+        raise ValueError(  # noqa: TRY004 - Pydantic validators must raise ValueError
             f"{field}.id needs an id, and none was given (got {ident!r}); "
             f"pass the id right after the flag{hint}"
         )
@@ -187,8 +190,7 @@ def environment_class(taskset_id: str, env_id: str = "") -> type[Env]:
 def load_environment(config: EnvConfig) -> Env:
     """Construct the env for `config`. Every construction site (eval, serve, gepa)
     goes through here so subclass envs load everywhere."""
-    taskset_id = config.taskset.id if config.taskset is not None else ""
-    return environment_class(taskset_id, config.id)(config)
+    return environment_class(config.taskset.id, config.id)(config)
 
 
 def load_taskset(config: TasksetConfig) -> Taskset:
@@ -239,8 +241,7 @@ def resolve_env_config(data: dict | EnvConfig | None) -> EnvConfig:
     validate. The one entry every consumer takes (CLI, TOML, the env-server wire),
     so role fields always validate against the real config class."""
     if isinstance(data, EnvConfig):
-        taskset_id = data.taskset.id if data.taskset is not None else ""
-        cls = env_config_type(taskset_id, data.id)
+        cls = env_config_type(data.taskset.id, data.id)
         if isinstance(data, cls):
             return data  # already at least as specifically typed — keep
         data = data.model_dump()
@@ -260,4 +261,4 @@ def resolve_env_config(data: dict | EnvConfig | None) -> EnvConfig:
 def task_type(taskset_id: str) -> type[Task]:
     """The taskset's `Task` subclass from its generic parameters — no data is
     loaded, so replay can cheaply recover the task type. Falls back to `Task`."""
-    return generic_type(taskset_class(taskset_id), Task, origin=Taskset) or Task
+    return taskset_class(taskset_id).task_type()

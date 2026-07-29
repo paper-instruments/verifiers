@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import threading
+import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -106,9 +107,10 @@ def response_from_generate(
         if result.get("finish_reason") in FINISH_REASONS
         else None
     )
+    response_scope = result.get("request_id") or uuid.uuid4().hex
     tool_calls = [
         ToolCall(
-            id=tc.id or f"call_{i}",
+            id=tc.id or f"call_{response_scope}_{i}",
             name=tc.name,
             arguments=tc.arguments
             if isinstance(tc.arguments, str)

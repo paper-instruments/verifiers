@@ -15,6 +15,8 @@ from verifiers.v1.configs.env import EnvConfig
 from verifiers.v1.loaders import load_environment
 from verifiers.v1.serve.types import (
     BaseResponse,
+    CancelRequest,
+    CancelResponse,
     HealthResponse,
     InfoResponse,
     RunGroupRequest,
@@ -24,6 +26,7 @@ from verifiers.v1.serve.types import (
 )
 from verifiers.v1.task import Task, task_data_cls
 from verifiers.v1.types import SamplingConfig
+from verifiers.v1.utils.aio import run_shielded
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,7 @@ class EnvServer:
         self._clients: dict[
             tuple[str, str], Client
         ] = {}  # (client_config, model) -> Client
+        self._request_tasks: dict[tuple[bytes, bytes], asyncio.Task[None]] = {}
 
         self.ctx = zmq.asyncio.Context()
         self.frontend = self.ctx.socket(zmq.ROUTER)
@@ -136,6 +140,37 @@ class EnvServer:
             "signals inside their own rollout — request run instead"
         )
 
+    async def _cancel(self, client_id: bytes, req: CancelRequest) -> CancelResponse:
+        task = self._request_tasks.get((client_id, req.target_request_id.encode()))
+        if task is None:
+            return CancelResponse(cancelled=False)
+        running = not task.done()
+        if running and not task.cancelling():
+            task.cancel()
+        if running:
+            await asyncio.wait((task,))
+        return CancelResponse(cancelled=running)
+
+    def _discard_request_task(
+        self, key: tuple[bytes, bytes], task: asyncio.Task[None]
+    ) -> None:
+        if self._request_tasks.get(key) is task:
+            del self._request_tasks[key]
+
+    async def _shutdown(self, tasks: tuple[asyncio.Task, ...]) -> None:
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._request_tasks.clear()
+        for client in self._clients.values():
+            with contextlib.suppress(Exception):
+                await client.close()
+        self.frontend.close()
+        self.ctx.term()
+        logger.info("EnvServer down: taskset=%s", self.taskset_id)
+
     async def _handle(
         self, client_id: bytes, request_id: bytes, method: bytes, payload: bytes
     ) -> None:
@@ -148,6 +183,10 @@ class EnvServer:
                 response = InfoResponse(
                     num_tasks=self.num_tasks,
                     requires_group_scoring=self.requires_group_scoring,
+                )
+            elif route == "cancel":
+                response = await self._cancel(
+                    client_id, CancelRequest.model_validate(raw)
                 )
             elif route == "run":
                 response = await self._run(RunRequest.model_validate(raw))
@@ -205,14 +244,14 @@ class EnvServer:
                     )
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
+                    if method in (b"run", b"run_group"):
+                        key = (client_id, request_id)
+                        self._request_tasks[key] = task
+                        task.add_done_callback(
+                            lambda done, key=key: self._discard_request_task(key, done)
+                        )
             except (asyncio.CancelledError, KeyboardInterrupt):
                 pass
             finally:
-                for task in tasks:
-                    task.cancel()
-                for client in self._clients.values():
-                    with contextlib.suppress(Exception):
-                        await client.close()
-                self.frontend.close()
-                self.ctx.term()
-                logger.info("EnvServer down: taskset=%s", self.taskset_id)
+                with contextlib.suppress(asyncio.CancelledError):
+                    await run_shielded(self._shutdown(tuple(tasks)))

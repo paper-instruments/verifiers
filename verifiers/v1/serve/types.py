@@ -43,6 +43,16 @@ class InfoResponse(BaseResponse):
     own rollout)."""
 
 
+class CancelRequest(BaseRequest):
+    method: ClassVar[str] = "cancel"
+    target_request_id: str
+
+
+class CancelResponse(BaseResponse):
+    cancelled: bool = False
+    """Whether the target was still running when the server handled cancellation."""
+
+
 class RunRequest(BaseRequest):
     """One env-rollout. v1 ships the task itself (`task_data`, the dumped `TaskData`
     the server validates into the taskset's declared type); the legacy bridge

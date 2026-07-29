@@ -23,6 +23,8 @@ from verifiers.v1.clients.config import ClientConfig
 from verifiers.v1.serve.types import (
     BaseRequest,
     BaseResponse,
+    CancelRequest,
+    CancelResponse,
     HealthRequest,
     HealthResponse,
     InfoRequest,
@@ -40,6 +42,8 @@ from verifiers.v1.types import SamplingConfig
 logger = logging.getLogger(__name__)
 
 ResponseT = TypeVar("ResponseT", bound=BaseResponse)
+_REMOTE_CANCEL_TIMEOUT = 30.0
+"""Most seconds cancellation waits for the server to finish remote cleanup."""
 
 
 class EnvClient:
@@ -53,27 +57,50 @@ class EnvClient:
         self.socket.connect(address)
         self._pending: dict[str, asyncio.Future[bytes]] = {}
         self._receiver: asyncio.Task | None = None
+        self._receiver_error: ConnectionError | None = None
         self._decode_slots = asyncio.BoundedSemaphore(1)
+        self._closed = False
 
     def _ensure_receiver(self) -> None:
+        if self._closed:
+            raise RuntimeError("env client is closed")
+        if self._receiver_error is not None:
+            raise self._receiver_error
         if self._receiver is None:
             self._receiver = asyncio.create_task(self._receive_loop())
 
     async def _receive_loop(self) -> None:
-        while True:
-            try:
+        try:
+            while True:
                 request_id_bytes, data = await self.socket.recv_multipart()
-            except asyncio.CancelledError:
-                break
-            future = self._pending.pop(request_id_bytes.decode(), None)
-            if future is not None and not future.done():
-                future.set_result(data)
+                future = self._pending.pop(request_id_bytes.decode(), None)
+                if future is not None and not future.done():
+                    future.set_result(data)
+        except asyncio.CancelledError:
+            if not self._closed:
+                self._fail_pending(
+                    ConnectionError("env server response receiver stopped unexpectedly")
+                )
+        except Exception as error:
+            failure = ConnectionError(
+                f"env server response receiver failed: {type(error).__name__}: {error}"
+            )
+            self._fail_pending(failure)
+            logger.warning("%s", failure, exc_info=True)
+
+    def _fail_pending(self, error: ConnectionError) -> None:
+        self._receiver_error = error
+        pending, self._pending = self._pending, {}
+        for future in pending.values():
+            if not future.done():
+                future.set_exception(error)
 
     async def _request(
         self,
         request: BaseRequest,
         response_type: type[ResponseT],
         timeout: float | None = None,
+        cancel_remote: bool = False,
     ) -> ResponseT:
         """Send a typed request and validate the reply into `response_type`. A
         `timeout` is only used for health polling — rollouts run untimed."""
@@ -81,16 +108,31 @@ class EnvClient:
         request_id = uuid.uuid4().hex
         future: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        payload = msgpack.packb(request.model_dump(mode="json"), use_bin_type=True)
-        await self.socket.send_multipart(
-            [request_id.encode(), request.method.encode(), payload]
-        )
         try:
+            payload = msgpack.packb(request.model_dump(mode="json"), use_bin_type=True)
+            await self.socket.send_multipart(
+                [request_id.encode(), request.method.encode(), payload]
+            )
             data = await asyncio.wait_for(future, timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            self._pending.pop(request_id, None)
+        except asyncio.TimeoutError:
+            self._discard_pending(request_id, future)
             raise
-        if response_type in (HealthResponse, InfoResponse):
+        except asyncio.CancelledError:
+            self._discard_pending(request_id, future)
+            if cancel_remote:
+                try:
+                    await self._wait_for_remote_cancel(request_id)
+                except (Exception, asyncio.CancelledError):
+                    logger.warning(
+                        "remote cancellation acknowledgement failed for request %s",
+                        request_id,
+                        exc_info=True,
+                    )
+            raise
+        except BaseException:
+            self._discard_pending(request_id, future)
+            raise
+        if response_type in (CancelResponse, HealthResponse, InfoResponse):
             response = response_type.model_validate(msgpack.unpackb(data, raw=False))
         else:
             # Keep large trace replies compact on the loop and expand only one at a time.
@@ -114,6 +156,36 @@ class EnvClient:
         if not response.success:
             raise RuntimeError(response.error or "env server request failed")
         return response
+
+    def _discard_pending(self, request_id: str, future: asyncio.Future[bytes]) -> None:
+        if self._pending.get(request_id) is future:
+            del self._pending[request_id]
+        if not future.done():
+            future.cancel()
+
+    async def _wait_for_remote_cancel(self, request_id: str) -> None:
+        cancellation = asyncio.create_task(self.cancel(request_id))
+        deadline = asyncio.get_running_loop().time() + _REMOTE_CANCEL_TIMEOUT
+        try:
+            while not cancellation.done():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "remote cancellation acknowledgement exceeded "
+                        f"{_REMOTE_CANCEL_TIMEOUT:g}s"
+                    )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(cancellation), timeout=remaining
+                    )
+                except asyncio.CancelledError:
+                    continue
+            cancellation.result()
+        finally:
+            if not cancellation.done():
+                cancellation.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cancellation
 
     async def health(self, timeout: float = 2.0) -> bool:
         try:
@@ -140,6 +212,12 @@ class EnvClient:
         """Return the taskset `num_tasks` + whether its tasks group-score (legacy v0 only)."""
         return await self._request(InfoRequest(), InfoResponse)
 
+    async def cancel(self, target_request_id: str) -> CancelResponse:
+        """Cancel one request and return after its remote cleanup has finished."""
+        return await self._request(
+            CancelRequest(target_request_id=target_request_id), CancelResponse
+        )
+
     async def run(
         self, task_idx: int, client: ClientConfig, model: str, sampling: SamplingConfig
     ) -> WireEpisode:
@@ -150,6 +228,7 @@ class EnvClient:
                 task_idx=task_idx, client=client, model=model, sampling=sampling
             ),
             RunResponse,
+            cancel_remote=True,
         )
         return response.episode
 
@@ -168,14 +247,22 @@ class EnvClient:
                 task_idx=task_idx, n=n, client=client, model=model, sampling=sampling
             ),
             RunGroupResponse,
+            cancel_remote=True,
         )
         return response.traces
 
     async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if self._receiver is not None:
             self._receiver.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._receiver
             self._receiver = None
+        pending, self._pending = self._pending, {}
+        for future in pending.values():
+            if not future.done():
+                future.set_exception(ConnectionError("env client closed"))
         self.socket.close()
         self.ctx.term()

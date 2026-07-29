@@ -285,10 +285,10 @@ class Agent:
             if await run.open():
                 await run.step()
             trace = await run.close()
-        except BaseException:
+        except BaseException as error:
             # A cancellation mid-run (or a lifetime bug raised to the caller) means
             # close() never runs — free the run's servers and owned runtime first.
-            await run.abort()
+            await run.abort(error)
             raise
         if trace.runtime is not None:
             trace.runtime.borrowed = runtime is not None

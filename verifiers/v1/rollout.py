@@ -8,7 +8,6 @@ boundary (see `verifiers.v1.mcp.user`).
 """
 
 import asyncio
-import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
@@ -41,6 +40,7 @@ from verifiers.v1.mcp import SharedToolServer, serve_tools, serve_user
 from verifiers.v1.state import state_cls
 from verifiers.v1.task import Task
 from verifiers.v1.trace import AgentInfo, Trace, TraceTask, VersionInfo
+from verifiers.v1.utils.aio import run_shielded
 from verifiers.v1.utils.version import verifiers_commit
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,7 @@ class RolloutRun:
         self._failed = False
         self._opened = False
         self._closed = False
+        self._aborted = False
         self._endpoint: str | None = None
         self._urls: dict[str, str] = {}
         self.deadline_at: float | None = None
@@ -254,11 +255,11 @@ class RolloutRun:
         except Exception as e:
             self.fail(e)
             return False
-        except BaseException:
+        except BaseException as error:
             # A cancellation mid-setup kills the driver's await with it, so no
             # caller reaches close() — free the started runtime and entered
             # servers here rather than relying on the driver's own guard.
-            await self.abort()
+            await self.abort(error)
             raise
         now = time.time()
         self.trace.timing.setup.end = now
@@ -310,17 +311,50 @@ class RolloutRun:
             return False
         return self.ok
 
-    async def abort(self) -> None:
+    async def abort(self, error: BaseException) -> None:
         """Free everything this run holds — the entered servers and an owned
         runtime — without finalizing or scoring: the escape path when an exception
         (a cancellation mid-setup, a lifetime bug raised to the caller) means the
-        driver will never reach `close()`. Safe after a partial `close()`."""
+        driver will never reach `close()`. Notify the harness after teardown so it
+        can finalize lifecycle state without scoring. Safe after a partial
+        `close()` and idempotent."""
+        if self._aborted:
+            return
+        self._aborted = True
         self._closed = True
-        with contextlib.suppress(Exception):
-            await self._stack.aclose()
-        if self._owns_runtime and self.runtime is not None:
-            with contextlib.suppress(Exception):
-                await self.runtime.stop()
+        try:
+            await run_shielded(self._abort_cleanup(error))
+        except asyncio.CancelledError:
+            pass
+        except BaseException:
+            logger.warning(
+                "rollout abort cleanup failed for %s",
+                self.trace.id,
+                exc_info=True,
+            )
+
+    async def _abort_cleanup(self, error: BaseException) -> None:
+        for label, cleanup in (
+            ("resource stack", self._stack.aclose),
+            (
+                "runtime",
+                self.runtime.stop
+                if self._owns_runtime and self.runtime is not None
+                else None,
+            ),
+            ("harness hook", lambda: self.harness.abort(self.trace, error)),
+        ):
+            if cleanup is None:
+                continue
+            try:
+                await cleanup()
+            except BaseException:
+                logger.warning(
+                    "rollout %s abort %s failed",
+                    self.trace.id,
+                    label,
+                    exc_info=True,
+                )
 
     async def close(self) -> Trace:
         """Finish the rollout: tool servers and interception down, task `finalize`

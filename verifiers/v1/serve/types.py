@@ -41,6 +41,16 @@ class InfoResponse(BaseResponse):
     own rollout)."""
 
 
+class CancelRequest(BaseRequest):
+    method: ClassVar[str] = "cancel"
+    target_request_id: str
+
+
+class CancelResponse(BaseResponse):
+    cancelled: bool = False
+    """Whether the target was still running when the server handled cancellation."""
+
+
 class RunRequest(BaseRequest):
     method: ClassVar[str] = "run"
     task_idx: int = Field(ge=0)

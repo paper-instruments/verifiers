@@ -13,6 +13,7 @@ This is the only place that imports the v0 ``verifiers`` API; all imports of it 
 v1 stays importable without the v0 package present.
 """
 
+import asyncio
 import contextlib
 import logging
 from pathlib import Path
@@ -364,6 +365,7 @@ class LegacyEnvServer(EnvServer):
         self.num_tasks: int | None = len(self.dataset)  # drives the `info` response
         self.requires_group_scoring = self.env.requires_group_rollouts
         self._clients: dict[tuple[str, str], Any] = {}
+        self._request_tasks: dict[tuple[bytes, bytes], asyncio.Task[None]] = {}
 
         self.ctx = zmq.asyncio.Context()
         self.frontend = self.ctx.socket(zmq.ROUTER)

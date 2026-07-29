@@ -102,6 +102,14 @@ class Harness(ABC, Generic[ConfigT]):
     async def setup(self, runtime: Runtime) -> None:
         """Provision this harness in `runtime` before its execution timeout starts."""
 
+    async def abort(self, trace: Trace, error: BaseException) -> None:
+        """Finalize harness-owned state after a run escapes through `BaseException`.
+
+        This is the cancellation/interrupt path, after rollout resources are torn
+        down. Expected rollout errors and deadline timeouts follow normal
+        finalization and scoring instead.
+        """
+
     async def run(
         self,
         ctx: ModelContext,

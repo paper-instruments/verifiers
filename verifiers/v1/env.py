@@ -5,7 +5,7 @@ import contextlib
 import logging
 import traceback
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import (
     Generic,
@@ -304,6 +304,8 @@ class Env(ABC, Generic[ConfigT]):
         ctx: ModelContext,
         semaphore: asyncio.Semaphore | None = None,
         on_complete: Callable[[Episode], Awaitable[None]] | None = None,
+        *,
+        trace_info: Mapping[str, object] | None = None,
     ) -> Episode:
         """Run one planned episode to completion, with whole-episode
         retries per `--env.retries`; `semaphore` gates the agent RUNS, not the
@@ -318,10 +320,14 @@ class Env(ABC, Generic[ConfigT]):
                 with contextlib.suppress(ValueError):
                     live.remove(trace)
 
+            def capture(trace: Trace) -> None:
+                trace.info.update(trace_info or {})
+                live.append(trace)
+
             return await self.run_episode(
                 slot.task,
                 ctx,
-                on_trace=live.append,
+                on_trace=capture,
                 on_discard=discard,
                 gate=semaphore,
             )

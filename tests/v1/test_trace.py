@@ -4,8 +4,10 @@ recompute on load), transient `state` never crosses the wire, and the permissive
 dump without importing the originating taskset."""
 
 import json
+from types import SimpleNamespace
 
 import verifiers.v1 as vf
+from verifiers.v1.env import RunSlot
 from verifiers.v1.graph import MessageNode
 from verifiers.v1.types import AssistantMessage, UserMessage
 
@@ -16,6 +18,43 @@ class MyTask(vf.TaskData):
 
 class MyState(vf.State):
     score: int = 0
+
+
+class _StubEnv(vf.Env):
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(retries=vf.RetryConfig())
+
+    async def run(self, task, agents) -> None:
+        raise NotImplementedError
+
+
+async def test_run_slot_seeds_trace_info_at_mint() -> None:
+    task = vf.Task(vf.TaskData(idx=3, prompt="hello"))
+    trace = vf.Trace(task=vf.TraceTask(type="Task", data=task.data))
+    env = _StubEnv()
+
+    async def run_episode(task, ctx, *, on_trace, **kwargs):
+        assert trace.info == {}
+        on_trace(trace)
+        assert trace.info == {
+            "rollout_group_id": "group-7",
+            "sampled_policy_version": 4,
+        }
+        return vf.Episode.of(trace)
+
+    env.run_episode = run_episode
+    slot = RunSlot(task)
+
+    await env.run_slot(
+        slot,
+        None,
+        trace_info={
+            "rollout_group_id": "group-7",
+            "sampled_policy_version": 4,
+        },
+    )
+
+    assert slot.traces == [trace]
 
 
 def test_bare_trace_round_trip():

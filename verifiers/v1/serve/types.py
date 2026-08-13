@@ -1,4 +1,4 @@
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field, field_serializer, model_validator
 
@@ -51,6 +51,8 @@ class RunRequest(BaseRequest):
     method: ClassVar[str] = "run"
     task_data: dict | None = None
     task_idx: int | None = Field(None, ge=0)
+    trace_info: dict[str, Any] = Field(default_factory=dict)
+    """Initial values merged into every trace before rollout setup begins."""
     client: ClientConfig
     model: str
     sampling: SamplingConfig

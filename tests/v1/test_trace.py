@@ -30,7 +30,10 @@ class _StubEnv(vf.Env):
 
 async def test_run_slot_seeds_trace_info_at_mint() -> None:
     task = vf.Task(vf.TaskData(idx=3, prompt="hello"))
-    trace = vf.Trace(task=vf.TraceTask(type="Task", data=task.data))
+    trace = vf.Trace(
+        agent=vf.AgentInfo(config=vf.AgentConfig()),
+        task=vf.TraceTask(type="Task", data=task.data),
+    )
     env = _StubEnv()
 
     async def run_episode(task, ctx, *, on_trace, **kwargs):

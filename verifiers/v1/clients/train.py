@@ -270,8 +270,20 @@ class ElasticRendererPool:
             from renderers.base import load_tokenizer
 
             def build():
+                tokenizer = load_tokenizer(self.renderer_model)
+                from verifiers.v1.clients.qwen38 import (
+                    create_qwen38_renderer,
+                    is_qwen38_model,
+                )
+
+                if is_qwen38_model(self.renderer_model):
+                    return create_qwen38_renderer(
+                        tokenizer,
+                        self.config,
+                        chat_template_kwargs=self.chat_template_kwargs,
+                    )
                 return create_renderer(
-                    load_tokenizer(self.renderer_model),
+                    tokenizer,
                     self.config,
                     chat_template_kwargs=self.chat_template_kwargs,
                 )

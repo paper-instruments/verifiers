@@ -10,9 +10,9 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from verifiers.v1.clients.config import EvalClientConfig
 
 from verifiers.v1.configs.cli.eval import EvalConfig
+from verifiers.v1.configs.client import EvalClientConfig
 from verifiers.v1.serve.types import RunRequest
 from verifiers.v1.types import SamplingConfig
 

@@ -11,13 +11,18 @@ needs a running vLLM engine.
 import json
 import uuid
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from openai import AsyncOpenAI, OpenAIError
 from renderers import OverlongPromptError as RendererOverlongPromptError
-from renderers import RenderedTokens, RendererConfig
+from renderers import RenderedTokens, RendererConfig, create_renderer_pool
+from renderers.configs import Qwen36RendererConfig
 
 from verifiers.v1.clients.client import SESSION_ID_HEADER, Client
+from verifiers.v1.clients.qwen38 import (
+    create_qwen38_renderer_pool,
+    is_qwen38_model,
+)
 from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect, parse_tools
 from verifiers.v1.dialects.chat import message_to_wire
 from verifiers.v1.errors import OverlongPromptError, model_error
@@ -205,16 +210,21 @@ class TrainClient(Client):
     ):
         renderer_model = self.renderer_model_name or model
         if self._pool is None:
-            from renderers import create_renderer_pool
-
             pool_kwargs: dict[str, Any] = {"size": self.pool_size}
             if chat_template_kwargs:
                 pool_kwargs["chat_template_kwargs"] = chat_template_kwargs
-            self._pool = create_renderer_pool(
-                renderer_model,
-                self.config,
-                **pool_kwargs,
-            )
+            if is_qwen38_model(renderer_model):
+                self._pool = create_qwen38_renderer_pool(
+                    renderer_model,
+                    cast(Qwen36RendererConfig | None, self.config),
+                    **pool_kwargs,
+                )
+            else:
+                self._pool = create_renderer_pool(
+                    renderer_model,
+                    self.config,
+                    **pool_kwargs,
+                )
         return self._pool
 
     async def get_response(

@@ -4,11 +4,15 @@ import pytest
 from renderers.configs import Qwen36RendererConfig
 from renderers.qwen36 import Qwen36Renderer
 
+import verifiers.v1 as vf
 from verifiers.v1.clients.qwen38 import (
     QWEN38_MODEL_ID,
     Qwen38Renderer,
 )
-from verifiers.v1.clients.train import ElasticRendererPool
+from verifiers.v1.clients.train import ElasticRendererPool, TrainClient
+from verifiers.v1.configs.client import TrainClientConfig
+from verifiers.v1.dialects import ChatDialect
+from verifiers.v1.graph import prepare_turn
 
 QWEN38_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 
@@ -447,3 +451,78 @@ async def test_qwen38_pool_applies_config_and_reasoning_effort():
         assert renderer.config.preserve_thinking is False
         assert renderer.config.add_vision_id is True
         assert renderer.config.image_cache_max == 7
+
+
+async def test_train_client_records_tito_bridge_modes(monkeypatch):
+    calls = 0
+
+    async def generate(**kwargs):
+        nonlocal calls
+        renderer = kwargs["renderer"]
+        prompt_ids = kwargs["prompt_ids"]
+        content = f"answer {calls}"
+        if calls == 0:
+            full_ids = renderer.render_ids(
+                [*kwargs["messages"], {"role": "assistant", "content": content}]
+            )
+            completion_ids = full_ids[len(prompt_ids) :]
+        else:
+            completion_ids = [next(iter(renderer.get_stop_token_ids()))]
+        calls += 1
+        return {
+            "request_id": f"response-{calls}",
+            "prompt_ids": prompt_ids,
+            "completion_ids": completion_ids,
+            "completion_logprobs": [-0.1] * len(completion_ids),
+            "content": content,
+            "finish_reason": "stop",
+            "prompt_attribution": kwargs["prompt_attribution"],
+        }
+
+    monkeypatch.setattr("renderers.client.generate", generate)
+    client = TrainClient(
+        TrainClientConfig(
+            base_url="http://unused.test/v1",
+            renderer=Qwen36RendererConfig(
+                enable_thinking=True,
+                preserve_thinking=True,
+            ),
+            multiplex=1,
+        )
+    )
+    trace = vf.Trace(
+        agent=vf.AgentInfo(config=vf.AgentConfig()),
+        task=vf.TraceTask(
+            type="Task",
+            data=vf.TaskData(idx=0, prompt="question one"),
+        ),
+    )
+    sampling = vf.SamplingConfig(max_tokens=10)
+
+    first_user = vf.UserMessage(content="question one")
+    first_turn = prepare_turn(trace, [first_user])
+    first_response = await client.get_response(
+        ChatDialect(), {}, _tokenizer_snapshot(), sampling, turn=first_turn
+    )
+    first_turn.commit(first_response)
+
+    second_turn = prepare_turn(
+        trace,
+        [first_user, first_response.message, vf.UserMessage(content="question two")],
+    )
+    second_response = await client.get_response(
+        ChatDialect(), {}, _tokenizer_snapshot(), sampling, turn=second_turn
+    )
+    second_turn.commit(second_response)
+
+    changed_prompt = prepare_turn(trace, [vf.UserMessage(content="different branch")])
+    await client.get_response(
+        ChatDialect(), {}, _tokenizer_snapshot(), sampling, turn=changed_prompt
+    )
+    await client.close()
+
+    assert trace.info["tito_bridge_modes"] == [
+        "initial",
+        "incremental",
+        "fallback",
+    ]

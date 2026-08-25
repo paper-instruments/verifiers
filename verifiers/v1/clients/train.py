@@ -380,6 +380,7 @@ class TrainClient(Client):
             multiplex=self.config.multiplex,
         )
         bridged_turn: PendingTurn | None = None
+        bridge_mode = "initial" if turn is None or not turn.trace.nodes else "fallback"
 
         async with pool.acquire() as slot:
             renderer = slot.renderer
@@ -408,6 +409,7 @@ class TrainClient(Client):
                     multi_modal_data = bridged.multi_modal_data
                     prompt_attribution = bridged
                     bridged_turn = turn
+                    bridge_mode = "incremental"
                     sampling_params["routed_experts_prompt_start"] = max(
                         len(previous_prompt_ids) + len(previous_completion_ids) - 1,
                         0,
@@ -450,6 +452,8 @@ class TrainClient(Client):
         # No provider response to relay (we generated), so serialize one for the program; the
         # interception server hands `Response.raw` back regardless of client.
         response.raw = serialize_completion(response, model)
+        if turn is not None:
+            turn.trace.info.setdefault("tito_bridge_modes", []).append(bridge_mode)
         return response
 
     async def close(self) -> None:

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import threading
+import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -106,9 +107,10 @@ def response_from_generate(
         if result.get("finish_reason") in FINISH_REASONS
         else None
     )
+    response_scope = result.get("request_id") or uuid.uuid4().hex
     tool_calls = [
         ToolCall(
-            id=tc.id or f"call_{i}",
+            id=tc.id or f"call_{response_scope}_{i}",
             name=tc.name,
             arguments=tc.arguments
             if isinstance(tc.arguments, str)
@@ -268,8 +270,20 @@ class ElasticRendererPool:
             from renderers.base import load_tokenizer
 
             def build():
+                tokenizer = load_tokenizer(self.renderer_model)
+                from verifiers.v1.clients.qwen38 import (
+                    create_qwen38_renderer,
+                    is_qwen38_model,
+                )
+
+                if is_qwen38_model(self.renderer_model):
+                    return create_qwen38_renderer(
+                        tokenizer,
+                        self.config,
+                        chat_template_kwargs=self.chat_template_kwargs,
+                    )
                 return create_renderer(
-                    load_tokenizer(self.renderer_model),
+                    tokenizer,
                     self.config,
                     chat_template_kwargs=self.chat_template_kwargs,
                 )
@@ -366,6 +380,7 @@ class TrainClient(Client):
             multiplex=self.config.multiplex,
         )
         bridged_turn: PendingTurn | None = None
+        bridge_mode = "initial" if turn is None or not turn.trace.nodes else "fallback"
 
         async with pool.acquire() as slot:
             renderer = slot.renderer
@@ -394,6 +409,7 @@ class TrainClient(Client):
                     multi_modal_data = bridged.multi_modal_data
                     prompt_attribution = bridged
                     bridged_turn = turn
+                    bridge_mode = "incremental"
                     sampling_params["routed_experts_prompt_start"] = max(
                         len(previous_prompt_ids) + len(previous_completion_ids) - 1,
                         0,
@@ -436,6 +452,8 @@ class TrainClient(Client):
         # No provider response to relay (we generated), so serialize one for the program; the
         # interception server hands `Response.raw` back regardless of client.
         response.raw = serialize_completion(response, model)
+        if turn is not None:
+            turn.trace.info.setdefault("tito_bridge_modes", []).append(bridge_mode)
         return response
 
     async def close(self) -> None:

@@ -114,7 +114,12 @@ class EnvServer:
         (slot,) = self.env.slots(self._build_task(req.task_data))
         # The gate spans requests: `--max-concurrent` bounds this worker's episodes
         # in flight the same way the in-process eval's semaphore does.
-        episode = await self.env.run_slot(slot, ctx, self._gate)
+        episode = await self.env.run_slot(
+            slot,
+            ctx,
+            self._gate,
+            trace_info=req.trace_info,
+        )
         # Trust the env-minted episode; serialize it once before client-side re-typing.
         return RunResponse.model_construct(episode=episode)
 

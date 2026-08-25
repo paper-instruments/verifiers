@@ -13,7 +13,7 @@ import contextlib
 import logging
 import time
 import uuid
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import msgpack
 import zmq
@@ -147,6 +147,7 @@ class EnvClient:
         task_data: dict | None = None,
         # TODO: remove task_idx addressing once v0 (the legacy bridge) is deprecated.
         task_idx: int | None = None,
+        trace_info: dict[str, Any] | None = None,
     ) -> WireEpisode:
         """Run one rollout; return its episode record — flat traces (typed
         `Trace[WireTaskData]`) plus the shared stamp. A v1 server takes the task
@@ -156,6 +157,7 @@ class EnvClient:
             RunRequest(
                 task_data=task_data,
                 task_idx=task_idx,
+                trace_info=trace_info or {},
                 client=client,
                 model=model,
                 sampling=sampling,

@@ -37,7 +37,7 @@ from pydantic_core import PydanticSerializationError, from_json, to_json
 
 from verifiers.v1 import graph
 from verifiers.v1.clients import Client, resolve_client
-from verifiers.v1.configs.client import BaseClientConfig
+from verifiers.v1.configs.client import ClientConfig, RegisteredClientConfig
 from verifiers.v1.dialects import DIALECTS, Dialect
 from verifiers.v1.dialects.base import is_sse_done_event
 from verifiers.v1.errors import (
@@ -152,11 +152,10 @@ class InterceptionServer(Interception):
         """Rollouts currently registered — what the pools balance on."""
         return len(self.sessions)
 
-    def _client(self, config: BaseClientConfig) -> Client:
-        """The server-owned client for `config` — one per distinct endpoint config, shared
-        by every session registered under it, so the rollouts this server multiplexes reuse
-        one bounded keepalive pool instead of each opening (and tearing down) their own
-        connections. Closed with the server."""
+    def _client(self, config: ClientConfig) -> Client:
+        """Resolve a rollout-owned registered client or a shared endpoint client."""
+        if isinstance(config, RegisteredClientConfig):
+            return resolve_client(config)
         key = config.model_dump_json()
         client = self.clients.get(key)
         if client is None:
@@ -185,7 +184,11 @@ class InterceptionServer(Interception):
             # can't commit a late turn onto the concluded trace.
             session.release()
             if session.client is not None:
-                await session.client.release_session(session.trace.id)
+                try:
+                    await session.client.release_session(session.trace.id)
+                finally:
+                    if isinstance(session.ctx.client, RegisteredClientConfig):
+                        await session.client.close()
 
     @asynccontextmanager
     async def acquire(self, session: RolloutSession) -> AsyncIterator[Slot]:

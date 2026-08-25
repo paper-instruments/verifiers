@@ -6,8 +6,8 @@ interception server builds one per distinct config and shares it across the roll
 it multiplexes. The default Prime endpoint, API key, and team fall back to
 the active Prime CLI config, so direct `uv run eval` calls behave like `prime eval`.
 Both the eval entrypoint (its model client) and in-env LLM calls (e.g. a judge reward)
-build clients from these. `ClientConfig` is the CLI-selectable discriminated union
-(eval | train).
+build clients from these. `ClientConfig` also accepts a process-local registered factory
+for embedding applications that own their sampler transport.
 """
 
 import os
@@ -87,9 +87,17 @@ class TrainClientConfig(BaseClientConfig):
     lower this when rendering is the slow part (very long prompts, frequent bridge misses)."""
 
 
-# Discriminated union for a CLI-selectable client (`--client.type eval|train`).
+class RegisteredClientConfig(BaseConfig):
+    """A process-local client factory registered by an embedding application."""
+
+    type: Literal["registered"] = "registered"
+    key: str
+
+
+# Serializable client selection. Registered factories only resolve in their owning process.
 ClientConfig = Annotated[
-    EvalClientConfig | TrainClientConfig, Field(discriminator="type")
+    EvalClientConfig | TrainClientConfig | RegisteredClientConfig,
+    Field(discriminator="type"),
 ]
 
 

@@ -10,6 +10,57 @@ from verifiers.v1.interception.server import InterceptionServer
 from verifiers.v1.session import RolloutSession
 
 
+class RecordingClient(vf.Client):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def get_response(self, *args, **kwargs):
+        raise AssertionError("test client received an unexpected model request")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_registered_client_factory_is_serializable_and_server_owned():
+    clients: list[RecordingClient] = []
+
+    def factory() -> RecordingClient:
+        client = RecordingClient()
+        clients.append(client)
+        return client
+
+    with vf.register_client_factory(factory) as config:
+        assert vf.AgentConfig(client=config).model_dump(mode="json")["client"] == {
+            "type": "registered",
+            "key": config.key,
+        }
+        sessions = [
+            RolloutSession(
+                ModelContext(model="model", client=config),
+                vf.Trace(
+                    agent=vf.AgentInfo(config=vf.AgentConfig()),
+                    task=vf.TraceTask(
+                        type="Task", data=vf.TaskData(idx=i, prompt="test")
+                    ),
+                ),
+            )
+            for i in range(2)
+        ]
+
+        async with (
+            InterceptionServer() as server,
+            server.acquire(sessions[0]),
+            server.acquire(sessions[1]),
+        ):
+            assert sessions[0].client is not sessions[1].client
+
+        assert len(clients) == 2
+        assert all(client.closed for client in clients)
+
+    with pytest.raises(RuntimeError, match="No client factory is registered"):
+        vf.resolve_client(config)
+
+
 async def test_cancelled_rollout_releases_its_router_session(unused_tcp_port):
     released = []
 

@@ -3,8 +3,10 @@
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 import httpx
 
@@ -12,6 +14,7 @@ from verifiers.v1.clients.base import join_url
 from verifiers.v1.configs.client import (
     BaseClientConfig,
     ClientConfig,
+    RegisteredClientConfig,
     TrainClientConfig,
     resolve_api_key,
 )
@@ -23,6 +26,8 @@ SESSION_ID_HEADER = "X-Session-ID"
 _RELEASE_RETRY_DELAYS = (0.05, 0.1)
 
 logger = logging.getLogger(__name__)
+
+_CLIENT_FACTORIES: dict[str, Callable[[], "Client"]] = {}
 
 """Per-rollout routing header (the trace id, same value every turn), so a session-affinity
 router pins a rollout's turns to one engine and its growing prefix stays KV-cached."""
@@ -117,7 +122,28 @@ class Client(ABC):
         pass
 
 
-def resolve_client(config: BaseClientConfig) -> Client:
+@contextmanager
+def register_client_factory(
+    factory: Callable[[], Client],
+) -> Iterator[RegisteredClientConfig]:
+    """Expose a process-local client factory through a serializable config."""
+    config = RegisteredClientConfig(key=uuid4().hex)
+    _CLIENT_FACTORIES[config.key] = factory
+    try:
+        yield config
+    finally:
+        del _CLIENT_FACTORIES[config.key]
+
+
+def resolve_client(config: ClientConfig) -> Client:
+    if isinstance(config, RegisteredClientConfig):
+        try:
+            factory = _CLIENT_FACTORIES[config.key]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"No client factory is registered for key {config.key!r} in this process"
+            ) from exc
+        return factory()
     if isinstance(config, TrainClientConfig):
         from verifiers.v1.clients.train import TrainClient
 

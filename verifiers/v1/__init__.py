@@ -10,7 +10,9 @@ from verifiers.v1.clients import (
     ClientConfig,
     EvalClientConfig,
     ModelContext,
+    RegisteredClientConfig,
     TrainClientConfig,
+    register_client_factory,
     resolve_client,
 )
 from verifiers.v1.configs.agent import AgentConfig
@@ -234,7 +236,9 @@ __all__ = [  # noqa: RUF022 - grouped by public API area
     "BaseClientConfig",
     "ClientConfig",
     "EvalClientConfig",
+    "RegisteredClientConfig",
     "TrainClientConfig",
+    "register_client_factory",
     "resolve_client",
     # taskset / harness / runtime / environment
     "Taskset",

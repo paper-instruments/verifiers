@@ -1,21 +1,62 @@
 """Client interfaces for model inference and relay."""
 
+import asyncio
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
+import httpx
+
+from verifiers.v1.clients.base import join_url
 from verifiers.v1.configs.client import (
     BaseClientConfig,
     ClientConfig,
     TrainClientConfig,
+    resolve_api_key,
 )
 from verifiers.v1.dialects import Dialect
 from verifiers.v1.graph import PendingTurn
 from verifiers.v1.types import Response, Sampling, SamplingConfig
 
 SESSION_ID_HEADER = "X-Session-ID"
+_RELEASE_RETRY_DELAYS = (0.05, 0.1)
+
+logger = logging.getLogger(__name__)
+
 """Per-rollout routing header (the trace id, same value every turn), so a session-affinity
 router pins a rollout's turns to one engine and its growing prefix stays KV-cached."""
+
+
+async def release_router_session(
+    client: httpx.AsyncClient,
+    config: BaseClientConfig,
+    session_id: str,
+) -> None:
+    """Best-effort release of router state for one completed rollout."""
+    if config.session_release_path is None:
+        return
+    for attempt in range(len(_RELEASE_RETRY_DELAYS) + 1):
+        try:
+            headers = httpx.Headers(config.headers)
+            headers.setdefault("Authorization", f"Bearer {resolve_api_key(config)}")
+            headers[SESSION_ID_HEADER] = session_id
+            response = await client.delete(
+                join_url(config.base_url, config.session_release_path),
+                headers=headers,
+            )
+            response.raise_for_status()
+            return
+        except Exception:  # Cleanup must never invalidate a rollout.
+            if attempt == len(_RELEASE_RETRY_DELAYS):
+                logger.warning(
+                    "router session release failed after %d attempts (session %s)",
+                    attempt + 1,
+                    session_id,
+                    exc_info=True,
+                )
+                return
+            await asyncio.sleep(_RELEASE_RETRY_DELAYS[attempt])
 
 
 @dataclass
@@ -68,6 +109,9 @@ class Client(ABC):
         """Relay a non-model-turn side request (an `aux_route`, e.g. Anthropic's `count_tokens`)
         as native JSON and return the provider JSON. Only the relay (eval) client supports it."""
         raise NotImplementedError(f"{type(self).__name__} does not relay aux routes")
+
+    async def release_session(self, session_id: str) -> None:
+        """Release router state for a completed rollout when its client opts in."""
 
     async def close(self) -> None:
         pass

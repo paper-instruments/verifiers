@@ -148,4 +148,4 @@ class ElasticInterceptionPool(Interception):
         try:
             yield server.base_url, model_secret, state_secret
         finally:
-            server.unregister(model_secret, state_secret)
+            await server.unregister(model_secret, state_secret)

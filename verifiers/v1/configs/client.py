@@ -33,6 +33,9 @@ class BaseClientConfig(BaseConfig):
     api_key_var: str = "PRIME_API_KEY"
     headers: dict[str, str] = Field(default_factory=dict)
     """Extra HTTP headers sent on every request."""
+    session_release_path: str | None = None
+    """Optional router endpoint called with ``DELETE`` and ``X-Session-ID`` when a
+    rollout ends. Leave unset for providers without session-lifecycle routing."""
 
     @model_validator(mode="after")
     def apply_prime_config(self) -> "BaseClientConfig":

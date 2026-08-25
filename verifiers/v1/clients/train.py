@@ -10,13 +10,22 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, TypeVar
 
+import httpx
 from openai import OpenAIError
 from renderers import OverlongPromptError as RendererOverlongPromptError
 from renderers import RenderedTokens, Renderer, RendererConfig
 from renderers.base import ToolCallParseStatus
 
-from verifiers.v1.clients.base import build_async_openai
-from verifiers.v1.clients.client import SESSION_ID_HEADER, Client
+from verifiers.v1.clients.base import (
+    DEFAULT_LIMITS,
+    DEFAULT_TIMEOUT,
+    build_async_openai,
+)
+from verifiers.v1.clients.client import (
+    SESSION_ID_HEADER,
+    Client,
+    release_router_session,
+)
 from verifiers.v1.configs.client import TrainClientConfig
 from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect, parse_tools
 from verifiers.v1.dialects.chat import message_to_wire
@@ -320,6 +329,11 @@ class TrainClient(Client):
     def __init__(self, config: TrainClientConfig) -> None:
         self.config = config
         self.client = build_async_openai(config)
+        self.release_client = (
+            httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, limits=DEFAULT_LIMITS)
+            if config.session_release_path is not None
+            else None
+        )
         # The per-request model is only known at call time; a config that pins the renderer
         # model can warm now, which is every training run (prime-rl always pins it).
         if config.renderer_model_name is not None:
@@ -458,3 +472,9 @@ class TrainClient(Client):
 
     async def close(self) -> None:
         await self.client.close()
+        if self.release_client is not None:
+            await self.release_client.aclose()
+
+    async def release_session(self, session_id: str) -> None:
+        if self.release_client is not None:
+            await release_router_session(self.release_client, self.config, session_id)

@@ -9,6 +9,7 @@ server; un-entered, each run brings its own."""
 
 import asyncio
 import logging
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
@@ -364,20 +365,51 @@ class Agent:
             raise RuntimeError("Agent is closed; create a new agent")
         retry = self.config.retries
         history: list = []
+        logical_trajectory_id = uuid.uuid4().hex
         for attempt in range(retry.max_retries + 1):
-            trace = await self._run_once(task, runtime, tools, on_trace)
-            if attempt == retry.max_retries or not trace_should_retry(trace, retry):
-                break
-            if runtime is not None:
-                logger.warning(
-                    "not retrying the rollout on a borrowed box (its state is no "
-                    "longer the task's start state); the error stands"
-                )
+            trace = await self._run_once(
+                task,
+                runtime,
+                tools,
+                on_trace,
+                trace_info={
+                    "logical_trajectory_id": logical_trajectory_id,
+                    "attempt_index": attempt,
+                    "retry_max_attempts": retry.max_retries + 1,
+                },
+            )
+            retryable = trace_should_retry(trace, retry)
+            if trace.ok:
+                disposition = "succeeded"
+            elif not retryable:
+                disposition = "not_retryable"
+            elif attempt == retry.max_retries:
+                disposition = "exhausted"
+            elif runtime is not None:
+                disposition = "not_retried"
+                trace.info["retry_blocked_reason"] = "borrowed_runtime"
+            else:
+                disposition = "retrying"
+            trace.info["retry_disposition"] = disposition
+            logger.info(
+                "agent rollout attempt: logical_trajectory_id=%s trace_id=%s "
+                "attempt=%d/%d disposition=%s error=%s",
+                logical_trajectory_id,
+                trace.id,
+                attempt + 1,
+                retry.max_retries + 1,
+                disposition,
+                trace.last_error.type if trace.last_error else None,
+            )
+            if disposition != "retrying":
                 break
             history.extend(trace.errors)
             delay = backoff(attempt)
             logger.warning(
-                "retrying agent rollout (retry %d/%d) in %.1fs after error: %s",
+                "retrying agent rollout: logical_trajectory_id=%s trace_id=%s "
+                "retry=%d/%d delay=%.1fs error=%s",
+                logical_trajectory_id,
+                trace.id,
                 attempt + 1,
                 retry.max_retries,
                 delay,
@@ -396,9 +428,17 @@ class Agent:
         runtime: Runtime | None,
         shared_tools: Mapping[str, SharedToolServer] | None,
         on_trace: Callable[[Trace], None] | None,
+        *,
+        trace_info: Mapping[str, object] | None = None,
     ) -> Trace:
         params = self._rollout_params(task, runtime, dict(shared_tools or {}))
-        run = Rollout(task=task, on_trace=on_trace, **params)
+
+        def trace_started(trace: Trace) -> None:
+            trace.info.update(trace_info or {})
+            if on_trace is not None:
+                on_trace(trace)
+
+        run = Rollout(task=task, on_trace=trace_started, **params)
         try:
             if await run.open():
                 await run.step()

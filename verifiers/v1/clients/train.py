@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, TypeVar
 
 import httpx
-from openai import OpenAIError
+from openai import APIStatusError, APITimeoutError, OpenAIError
 from renderers import OverlongPromptError as RendererOverlongPromptError
 from renderers import RenderedTokens, Renderer, RendererConfig
 from renderers.base import ToolCallParseStatus
@@ -46,6 +47,7 @@ from verifiers.v1.types import (
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+SLOW_INFERENCE_SECONDS = 480.0
 
 
 def tool_to_wire(tool: Tool) -> dict:
@@ -443,6 +445,14 @@ class TrainClient(Client):
                 multi_modal_data = rendered.multi_modal_data
                 prompt_attribution = rendered
 
+            started = time.monotonic()
+            attempt_context = (
+                f"session_id={session_id or 'unknown'} "
+                f"path_len={turn.path_len if turn is not None else 0} "
+                f"model={model} prompt_tokens={len(prompt_ids)} "
+                f"max_completion_tokens={sampling_params.get('max_tokens')} "
+                f"endpoint={self.config.base_url}"
+            )
             try:
                 result = await generate(
                     client=self.client,
@@ -460,8 +470,37 @@ class TrainClient(Client):
                 )
             except RendererOverlongPromptError as e:
                 raise OverlongPromptError(str(e)) from e
+            except APITimeoutError as e:
+                logger.warning(
+                    "inference attempt failed failure_kind=client_timeout "
+                    "elapsed_seconds=%.3f timeout_phase=%s %s",
+                    time.monotonic() - started,
+                    type(e.__cause__).__name__ if e.__cause__ else "unknown",
+                    attempt_context,
+                )
+                raise model_error(e) from e
+            except APIStatusError as e:
+                if e.status_code == 504:
+                    logger.warning(
+                        "inference attempt failed failure_kind=upstream_504 "
+                        "elapsed_seconds=%.3f %s request_id=%s",
+                        time.monotonic() - started,
+                        attempt_context,
+                        e.request_id or "unknown",
+                    )
+                raise model_error(e) from e
             except OpenAIError as e:
                 raise model_error(e) from e
+            elapsed = time.monotonic() - started
+            if elapsed >= SLOW_INFERENCE_SECONDS:
+                logger.warning(
+                    "inference attempt completed outcome=slow_success elapsed_seconds=%.3f "
+                    "%s completion_tokens=%d request_id=%s",
+                    elapsed,
+                    attempt_context,
+                    len(result.get("completion_ids") or []),
+                    result.get("request_id") or "unknown",
+                )
         response = response_from_generate(result, model, bridged_turn)
         # No provider response to relay (we generated), so serialize one for the program; the
         # interception server hands `Response.raw` back regardless of client.

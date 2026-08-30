@@ -690,6 +690,8 @@ class InterceptionServer(Interception):
             # the turn already committed (then only post-commit delivery failed).
             if node is None:
                 error = e
+            if isinstance(e, RolloutError):
+                session.error = e
             raise
         finally:
             # The turn's one per-exchange record: settings, timing, outcome, and the

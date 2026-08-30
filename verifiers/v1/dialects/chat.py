@@ -14,6 +14,7 @@ from typing import Any
 from openai.types.chat import ChatCompletion
 
 from verifiers.v1.dialects.base import Dialect, StreamParser, parse_sse_event
+from verifiers.v1.errors import ProviderError, model_error
 from verifiers.v1.types import (
     AssistantMessage,
     FinishReason,
@@ -47,6 +48,18 @@ FINISH_REASONS = frozenset({"stop", "length", "tool_calls"})
 # `reasoning` (vLLM / Together / OpenRouter), `reasoning_content` (DeepSeek / Qwen / SGLang /
 # Fireworks / Kimi), `reasoning_details` (OpenRouter / MiniMax).
 REASONING_FIELDS = ("reasoning", "reasoning_content", "reasoning_details")
+
+
+def _provider_finish_error(error: object) -> ProviderError:
+    details = error if isinstance(error, Mapping) else {}
+    code = details.get("code")
+    message = details.get("message") or "provider ended the completion with an error"
+    label = f"{code}: " if code is not None else ""
+    status = code if isinstance(code, int) and 400 <= code < 600 else 502
+    return model_error(
+        f"provider finish_reason=error: {label}{message}",
+        status_code=status,
+    )
 
 
 def reasoning_text(data: Mapping[str, Any]) -> str | None:
@@ -214,6 +227,7 @@ class ChatStreamParser(StreamParser):
     finish_reason: str | None = None
     usage: dict | None = None
     head: dict | None = None
+    error: object | None = None
 
     def feed(self, raw: bytes) -> None:
         chunk = parse_sse_event(raw)
@@ -222,6 +236,7 @@ class ChatStreamParser(StreamParser):
         if self.head is None:
             self.head = chunk
         self.usage = chunk.get("usage") or self.usage
+        self.error = chunk.get("error") or self.error
         for choice in chunk.get("choices") or []:
             if choice.get("index", 0) != 0:
                 continue
@@ -258,6 +273,8 @@ class ChatStreamParser(StreamParser):
                 )
 
     def finish(self) -> Response:
+        if self.finish_reason == "error":
+            raise _provider_finish_error(self.error)
         for key, parts in self.message_parts.items():
             if parts:
                 self.message[key] = "".join(parts)
@@ -342,6 +359,12 @@ class ChatDialect(Dialect[dict, ChatCompletion]):
 
     def parse_response(self, response: ChatCompletion) -> Response:
         return response_from_wire(response)
+
+    def validate_response(self, raw: dict) -> ChatCompletion:
+        choices = raw.get("choices") or []
+        if choices and choices[0].get("finish_reason") == "error":
+            raise _provider_finish_error(raw.get("error"))
+        return super().validate_response(raw)
 
     def stream_parser(self) -> StreamParser:
         return ChatStreamParser()

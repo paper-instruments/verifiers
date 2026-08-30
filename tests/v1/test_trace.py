@@ -4,9 +4,10 @@ recompute on load), transient `state` never crosses the wire, and the permissive
 dump without importing the originating taskset."""
 
 import json
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import verifiers.v1 as vf
+from verifiers.v1 import agent as agent_module
 from verifiers.v1.env import RunSlot
 from verifiers.v1.graph import MessageNode
 from verifiers.v1.types import AssistantMessage, UserMessage
@@ -58,6 +59,54 @@ async def test_run_slot_seeds_trace_info_at_mint() -> None:
     )
 
     assert slot.traces == [trace]
+
+
+async def test_agent_retries_share_logical_trajectory_identity(monkeypatch) -> None:
+    agent = object.__new__(vf.Agent)
+    agent._closed = False
+    agent.config = SimpleNamespace(
+        retries=vf.RetryConfig(max_retries=1, include=["ProviderError"])
+    )
+    task = vf.Task(vf.TaskData(idx=3, prompt="hello"))
+    attempts = []
+
+    async def run_once(
+        _self,
+        task,
+        runtime,
+        shared_tools,
+        on_trace,
+        *,
+        trace_info,
+    ):
+        trace = vf.Trace(
+            agent=vf.AgentInfo(config=vf.AgentConfig()),
+            task=vf.TraceTask(type="Task", data=task.data),
+        )
+        trace.info.update(trace_info)
+        if not attempts:
+            trace.record_error(vf.ProviderError("transient", status_code=503))
+        else:
+            trace.ok = True
+        attempts.append(trace)
+        if on_trace is not None:
+            on_trace(trace)
+        return trace
+
+    agent._run_once = MethodType(run_once, agent)
+    monkeypatch.setattr(agent_module, "backoff", lambda _attempt: 0.0)
+
+    result = await agent.run(task)
+
+    assert result is attempts[1]
+    assert attempts[0].info["logical_trajectory_id"] == attempts[1].info[
+        "logical_trajectory_id"
+    ]
+    assert [trace.info["attempt_index"] for trace in attempts] == [0, 1]
+    assert [trace.info["retry_disposition"] for trace in attempts] == [
+        "retrying",
+        "succeeded",
+    ]
 
 
 def test_bare_trace_round_trip():

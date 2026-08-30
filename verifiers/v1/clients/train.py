@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, TypeVar
 
 import httpx
-from openai import OpenAIError
+from openai import APITimeoutError, OpenAIError
 from renderers import OverlongPromptError as RendererOverlongPromptError
 from renderers import RenderedTokens, Renderer, RendererConfig
 from renderers.base import ToolCallParseStatus
@@ -444,6 +445,7 @@ class TrainClient(Client):
                 prompt_attribution = rendered
 
             try:
+                request_started = time.monotonic()
                 result = await generate(
                     client=self.client,
                     renderer=renderer,
@@ -461,6 +463,23 @@ class TrainClient(Client):
             except RendererOverlongPromptError as e:
                 raise OverlongPromptError(str(e)) from e
             except OpenAIError as e:
+                if isinstance(e, APITimeoutError):
+                    timeout = _inference_timeout_metadata(
+                        elapsed_seconds=time.monotonic() - request_started,
+                        session_id=session_id,
+                        endpoint=self.config.base_url,
+                    )
+                    if turn is not None:
+                        turn.trace.info["inference_timeout"] = timeout
+                    logger.warning(
+                        "train inference timeout: trace_id=%s session_id=%s "
+                        "timeout_seconds=%.1f elapsed_seconds=%.1f endpoint=%s",
+                        turn.trace.id if turn is not None else None,
+                        session_id,
+                        timeout["timeout_seconds"],
+                        timeout["elapsed_seconds"],
+                        self.config.base_url,
+                    )
                 raise model_error(e) from e
         response = response_from_generate(result, model, bridged_turn)
         # No provider response to relay (we generated), so serialize one for the program; the
@@ -478,3 +497,19 @@ class TrainClient(Client):
     async def release_session(self, session_id: str) -> None:
         if self.release_client is not None:
             await release_router_session(self.release_client, self.config, session_id)
+
+
+def _inference_timeout_metadata(
+    *,
+    elapsed_seconds: float,
+    session_id: str | None,
+    endpoint: str,
+) -> dict[str, object]:
+    return {
+        "layer": "verifiers_train_client",
+        "timeout_seconds": DEFAULT_TIMEOUT.read,
+        "elapsed_seconds": elapsed_seconds,
+        "status_code": 504,
+        "session_id": session_id,
+        "endpoint": endpoint,
+    }

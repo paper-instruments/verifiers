@@ -6,8 +6,34 @@ from aiohttp import web
 import verifiers.v1 as vf
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.configs.client import EvalClientConfig
+from verifiers.v1.dialects.chat import ChatDialect
+from verifiers.v1.errors import ProviderError
 from verifiers.v1.interception.server import InterceptionServer
 from verifiers.v1.session import RolloutSession
+
+
+def test_marked_timeout_response_disables_outer_sdk_retry():
+    response = InterceptionServer._error_response(
+        ChatDialect(),
+        ProviderError(
+            "timed out",
+            status_code=504,
+            suppress_outer_retry=True,
+        ),
+    )
+
+    assert response.status == 504
+    assert response.headers["x-should-retry"] == "false"
+
+
+@pytest.mark.parametrize("status_code", [503, 504])
+def test_unmarked_response_preserves_outer_sdk_retry_policy(status_code):
+    response = InterceptionServer._error_response(
+        ChatDialect(), ProviderError("unavailable", status_code=status_code)
+    )
+
+    assert response.status == status_code
+    assert "x-should-retry" not in response.headers
 
 
 async def test_cancelled_rollout_releases_its_router_session(unused_tcp_port):

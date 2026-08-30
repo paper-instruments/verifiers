@@ -255,9 +255,20 @@ class InterceptionServer(Interception):
         logger.warning(
             "rollout %s failed: %s: %s", session.trace.id, type(error).__name__, error
         )
+        return self._error_response(dialect, error)
+
+    @staticmethod
+    def _error_response(dialect: Dialect, error: RolloutError) -> web.Response:
+        status = getattr(error, "status_code", 502)
+        headers = (
+            {"x-should-retry": "false"}
+            if getattr(error, "suppress_outer_retry", False)
+            else None
+        )
         return web.json_response(
             dialect.error_body(str(error)),
-            status=getattr(error, "status_code", 502),
+            status=status,
+            headers=headers,
         )
 
     def record_call(
@@ -471,7 +482,8 @@ class InterceptionServer(Interception):
                     )
                 except RolloutError as e:
                     # Stash the real cause; the rollout re-raises it after the harness returns.
-                    # Relay the provider's status so the harness SDK retries 5xx/429 and not 4xx.
+                    # Relay the provider's status; completed timeout responses carry an
+                    # explicit no-retry signal so one long request is not multiplied.
                     error = e
                     session.error = e
                     logger.warning(
@@ -480,10 +492,7 @@ class InterceptionServer(Interception):
                         type(e).__name__,
                         e,
                     )
-                    return web.json_response(
-                        dialect.error_body(str(e)),
-                        status=getattr(e, "status_code", 502),
-                    )
+                    return self._error_response(dialect, e)
                 except Exception as e:  # noqa: BLE001 - surface as an API error
                     error = e
                     logger.warning(
@@ -588,9 +597,7 @@ class InterceptionServer(Interception):
                     type(e).__name__,
                     e,
                 )
-                return web.json_response(
-                    dialect.error_body(str(e)), status=getattr(e, "status_code", 502)
-                )
+                return self._error_response(dialect, e)
             except Exception as e:  # noqa: BLE001 - surface as an API error
                 error = e
                 logger.warning("model call failed: id=%s %s", session.trace.id, e)
@@ -725,9 +732,7 @@ class InterceptionServer(Interception):
                 type(e).__name__,
                 e,
             )
-            return web.json_response(
-                dialect.error_body(str(e)), status=getattr(e, "status_code", 502)
-            )
+            return self._error_response(dialect, e)
         except Exception as e:  # noqa: BLE001 - surface auxiliary relay failures
             logger.warning("aux call failed: id=%s %s", session.trace.id, e)
             return web.json_response(dialect.error_body(str(e)), status=502)

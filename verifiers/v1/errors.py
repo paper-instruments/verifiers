@@ -33,13 +33,20 @@ class RolloutError(Exception):
 
 class ProviderError(RolloutError):
     """A model-provider call failed (transport, HTTP status, timeout, or malformed response).
-    `status_code` is the HTTP status surfaced to the harness so its SDK retries transient faults
-    (5xx/429/timeout) and not deterministic ones (4xx) — relayed from the provider, or chosen for a
-    transport fault."""
+    `status_code` is the HTTP status surfaced to the harness — relayed from the provider, or chosen
+    for a transport fault. `suppress_outer_retry` marks a completed training inference timeout whose
+    full deadline must not be consumed again by the harness SDK."""
 
-    def __init__(self, message: str = "", *, status_code: int = 502) -> None:
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        status_code: int = 502,
+        suppress_outer_retry: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.suppress_outer_retry = suppress_outer_retry
 
 
 class OverlongPromptError(ProviderError):
@@ -128,13 +135,16 @@ def _provider_status(e: OpenAIError | str) -> int:
 
 
 def model_error(
-    e: OpenAIError | str, *, status_code: int | None = None
+    e: OpenAIError | str,
+    *,
+    status_code: int | None = None,
+    suppress_outer_retry: bool = False,
 ) -> ProviderError:
     """Map a provider failure to our error type: an overlong prompt (a budget limit the interception
     server turns into a clean truncation) is told apart from any other provider call failure, which
-    becomes a plain `ProviderError`. `status_code` is the HTTP status surfaced to the harness (whose
-    SDK then retries 5xx/429/timeout and not 4xx); derived from an SDK error when not given. Accepts
-    an SDK error (the renderer) or the provider's raw error body (the httpx proxy)."""
+    becomes a plain `ProviderError`. `status_code` is the HTTP status surfaced to the harness;
+    derived from an SDK error when not given. Accepts an SDK error (the renderer) or the provider's
+    raw error body (the httpx proxy)."""
     from openai import APIStatusError
 
     # Some SDK errors stringify empty; fall back to the type so the message is never blank.
@@ -150,4 +160,5 @@ def model_error(
     return ProviderError(
         text,
         status_code=status_code if status_code is not None else _provider_status(e),
+        suppress_outer_retry=suppress_outer_retry,
     )

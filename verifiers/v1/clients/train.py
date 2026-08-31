@@ -330,12 +330,15 @@ class TrainClient(Client):
 
     def __init__(self, config: TrainClientConfig) -> None:
         self.config = config
-        inference_timeout = httpx.Timeout(
-            connect=DEFAULT_TIMEOUT.connect,
-            read=config.inference_read_timeout_seconds,
-            write=DEFAULT_TIMEOUT.write,
-            pool=DEFAULT_TIMEOUT.pool,
-        )
+        inference_timeout = DEFAULT_TIMEOUT
+
+        if config.inference_read_timeout_seconds is not None:
+            inference_timeout = httpx.Timeout(
+                connect=DEFAULT_TIMEOUT.connect,
+                read=config.inference_read_timeout_seconds,
+                write=DEFAULT_TIMEOUT.write,
+                pool=DEFAULT_TIMEOUT.pool,
+            )
         self.client = build_async_openai(config, timeout=inference_timeout)
         self.release_client = (
             httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, limits=DEFAULT_LIMITS)
@@ -480,18 +483,17 @@ class TrainClient(Client):
                 elapsed = time.monotonic() - started
                 logger.warning(
                     "inference attempt failed failure_kind=client_timeout "
-                    "elapsed_seconds=%.3f configured_read_timeout_seconds=%g "
+                    "elapsed_seconds=%.3f read_timeout_seconds=%s "
                     "timeout_phase=%s %s",
                     elapsed,
-                    self.config.inference_read_timeout_seconds,
+                    self.client.timeout.read,
                     type(e.__cause__).__name__ if e.__cause__ else "unknown",
                     attempt_context,
                 )
                 raise model_error(
                     "Inference request timed out: "
                     "owner=verifiers.train_client "
-                    "configured_read_timeout_seconds="
-                    f"{self.config.inference_read_timeout_seconds:g} "
+                    f"read_timeout_seconds={self.client.timeout.read} "
                     f"elapsed_seconds={elapsed:.3f} "
                     "http_status=504 "
                     f"session_id={session_id or 'unknown'} "

@@ -8,6 +8,7 @@ from openai import APITimeoutError
 from pydantic import ValidationError
 from renderers import ParsedToolCall
 
+from verifiers.v1.clients.base import DEFAULT_TIMEOUT
 from verifiers.v1.clients.qwen38 import (
     QWEN38_MODEL_ID,
     is_qwen38_model,
@@ -67,14 +68,22 @@ def test_train_client_rejects_invalid_inference_timeout(timeout):
         TrainClientConfig(inference_read_timeout_seconds=timeout)
 
 
-async def test_train_client_timeout_is_configured_and_attributed(monkeypatch):
+@pytest.mark.parametrize(
+    ("configured_timeout", "expected_timeout"),
+    [(None, DEFAULT_TIMEOUT.read), (0.01, 0.01)],
+)
+async def test_train_client_timeout_is_configured_and_attributed(
+    monkeypatch, configured_timeout, expected_timeout
+):
     client = TrainClient(
         TrainClientConfig(
             base_url="http://router:8000/v1",
-            inference_read_timeout_seconds=0.01,
+            inference_read_timeout_seconds=configured_timeout,
         )
     )
-    assert client.client.timeout.read == 0.01
+    assert client.client.timeout.read == expected_timeout
+    if configured_timeout is None:
+        assert client.client.timeout is DEFAULT_TIMEOUT
 
     slot = SimpleNamespace(
         renderer=object(),
@@ -112,7 +121,8 @@ async def test_train_client_timeout_is_configured_and_attributed(monkeypatch):
     error = exc_info.value
     assert error.status_code == 504
     assert "owner=verifiers.train_client" in str(error)
-    assert "configured_read_timeout_seconds=0.01" in str(error)
+    assert f"configured_read_timeout_seconds={configured_timeout}" in str(error)
+    assert f"effective_read_timeout_seconds={expected_timeout}" in str(error)
     assert "elapsed_seconds=" in str(error)
     assert "http_status=504" in str(error)
     assert "session_id=trace-123" in str(error)

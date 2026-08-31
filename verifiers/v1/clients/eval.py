@@ -7,8 +7,17 @@ import httpx
 from pydantic import ValidationError
 from pydantic_core import from_json, to_json
 
-from verifiers.v1.clients.base import DEFAULT_LIMITS, DEFAULT_TIMEOUT, join_url
-from verifiers.v1.clients.client import SESSION_ID_HEADER, Client, RelayReply
+from verifiers.v1.clients.base import (
+    DEFAULT_LIMITS,
+    DEFAULT_TIMEOUT,
+    join_url,
+)
+from verifiers.v1.clients.client import (
+    SESSION_ID_HEADER,
+    Client,
+    RelayReply,
+    release_router_session,
+)
 from verifiers.v1.configs.client import BaseClientConfig, resolve_api_key
 from verifiers.v1.dialects import Dialect
 from verifiers.v1.errors import model_error
@@ -57,6 +66,7 @@ class EvalClient(Client):
     """Relay native JSON to the provider and parse a copy for the trace."""
 
     def __init__(self, config: BaseClientConfig) -> None:
+        self.config = config
         self.base_url = config.base_url
         self.api_key = resolve_api_key(config)
         # Keep endpoint headers separate so they can override intercepted request headers before
@@ -213,3 +223,6 @@ class EvalClient(Client):
 
     async def close(self) -> None:
         await self.client.aclose()
+
+    async def release_session(self, session_id: str) -> None:
+        await release_router_session(self.client, self.config, session_id)

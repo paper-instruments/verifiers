@@ -4,19 +4,29 @@ import asyncio
 import json
 import logging
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, TypeVar
 
-from openai import OpenAIError
+import httpx
+from openai import APIStatusError, APITimeoutError, OpenAIError
 from renderers import OverlongPromptError as RendererOverlongPromptError
 from renderers import RenderedTokens, Renderer, RendererConfig
 from renderers.base import ToolCallParseStatus
 
-from verifiers.v1.clients.base import build_async_openai
-from verifiers.v1.clients.client import SESSION_ID_HEADER, Client
+from verifiers.v1.clients.base import (
+    DEFAULT_LIMITS,
+    DEFAULT_TIMEOUT,
+    build_async_openai,
+)
+from verifiers.v1.clients.client import (
+    SESSION_ID_HEADER,
+    Client,
+    release_router_session,
+)
 from verifiers.v1.configs.client import TrainClientConfig
 from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect, parse_tools
 from verifiers.v1.dialects.chat import message_to_wire
@@ -37,6 +47,7 @@ from verifiers.v1.types import (
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+SLOW_INFERENCE_SECONDS = 480.0
 
 
 def tool_to_wire(tool: Tool) -> dict:
@@ -319,7 +330,21 @@ class TrainClient(Client):
 
     def __init__(self, config: TrainClientConfig) -> None:
         self.config = config
-        self.client = build_async_openai(config)
+        inference_timeout = DEFAULT_TIMEOUT
+
+        if config.inference_read_timeout_seconds is not None:
+            inference_timeout = httpx.Timeout(
+                connect=DEFAULT_TIMEOUT.connect,
+                read=config.inference_read_timeout_seconds,
+                write=DEFAULT_TIMEOUT.write,
+                pool=DEFAULT_TIMEOUT.pool,
+            )
+        self.client = build_async_openai(config, timeout=inference_timeout)
+        self.release_client = (
+            httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, limits=DEFAULT_LIMITS)
+            if config.session_release_path is not None
+            else None
+        )
         # The per-request model is only known at call time; a config that pins the renderer
         # model can warm now, which is every training run (prime-rl always pins it).
         if config.renderer_model_name is not None:
@@ -429,6 +454,14 @@ class TrainClient(Client):
                 multi_modal_data = rendered.multi_modal_data
                 prompt_attribution = rendered
 
+            started = time.monotonic()
+            attempt_context = (
+                f"session_id={session_id or 'unknown'} "
+                f"path_len={turn.path_len if turn is not None else 0} "
+                f"model={model} prompt_tokens={len(prompt_ids)} "
+                f"max_completion_tokens={sampling_params.get('max_tokens')} "
+                f"endpoint={self.config.base_url}"
+            )
             try:
                 result = await generate(
                     client=self.client,
@@ -446,8 +479,49 @@ class TrainClient(Client):
                 )
             except RendererOverlongPromptError as e:
                 raise OverlongPromptError(str(e)) from e
+            except APITimeoutError as e:
+                elapsed = time.monotonic() - started
+                logger.warning(
+                    "inference attempt failed failure_kind=client_timeout "
+                    "elapsed_seconds=%.3f read_timeout_seconds=%s "
+                    "timeout_phase=%s %s",
+                    elapsed,
+                    self.client.timeout.read,
+                    type(e.__cause__).__name__ if e.__cause__ else "unknown",
+                    attempt_context,
+                )
+                raise model_error(
+                    "Inference request timed out: "
+                    "owner=verifiers.train_client "
+                    f"read_timeout_seconds={self.client.timeout.read} "
+                    f"elapsed_seconds={elapsed:.3f} "
+                    "http_status=504 "
+                    f"session_id={session_id or 'unknown'} "
+                    f"endpoint={self.config.base_url}",
+                    status_code=504,
+                ) from e
+            except APIStatusError as e:
+                if e.status_code == 504:
+                    logger.warning(
+                        "inference attempt failed failure_kind=upstream_504 "
+                        "elapsed_seconds=%.3f %s request_id=%s",
+                        time.monotonic() - started,
+                        attempt_context,
+                        e.request_id or "unknown",
+                    )
+                raise model_error(e) from e
             except OpenAIError as e:
                 raise model_error(e) from e
+            elapsed = time.monotonic() - started
+            if elapsed >= SLOW_INFERENCE_SECONDS:
+                logger.warning(
+                    "inference attempt completed outcome=slow_success elapsed_seconds=%.3f "
+                    "%s completion_tokens=%d request_id=%s",
+                    elapsed,
+                    attempt_context,
+                    len(result.get("completion_ids") or []),
+                    result.get("request_id") or "unknown",
+                )
         response = response_from_generate(result, model, bridged_turn)
         # No provider response to relay (we generated), so serialize one for the program; the
         # interception server hands `Response.raw` back regardless of client.
@@ -458,3 +532,9 @@ class TrainClient(Client):
 
     async def close(self) -> None:
         await self.client.close()
+        if self.release_client is not None:
+            await self.release_client.aclose()
+
+    async def release_session(self, session_id: str) -> None:
+        if self.release_client is not None:
+            await release_router_session(self.release_client, self.config, session_id)

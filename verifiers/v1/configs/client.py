@@ -33,6 +33,9 @@ class BaseClientConfig(BaseConfig):
     api_key_var: str = "PRIME_API_KEY"
     headers: dict[str, str] = Field(default_factory=dict)
     """Extra HTTP headers sent on every request."""
+    session_release_path: str | None = None
+    """Optional router endpoint called with ``DELETE`` and ``X-Session-ID`` when a
+    rollout ends. Leave unset for providers without session-lifecycle routing."""
 
     @model_validator(mode="after")
     def apply_prime_config(self) -> "BaseClientConfig":
@@ -68,6 +71,13 @@ class TrainClientConfig(BaseClientConfig):
     `TrainClient`), so responses carry token ids + logprobs. Needs a running vLLM engine."""
 
     type: Literal["train"] = "train"
+    inference_read_timeout_seconds: float | None = Field(
+        None,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    """Optional response-read timeout for one request to the training inference endpoint.
+    `None` preserves the library's default timeout unchanged."""
     renderer: RendererConfig | None = None
     """The `renderers.RendererConfig` to use (the same shared type prime-rl configures).
     `None` auto-resolves from the model — which falls back to the default renderer (no

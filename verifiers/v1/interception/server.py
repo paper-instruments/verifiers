@@ -175,7 +175,7 @@ class InterceptionServer(Interception):
         self.state_routes[session.trace.id] = session
         return model_secret, state_secret
 
-    def unregister(self, model_secret: str, state_secret: str) -> None:
+    async def unregister(self, model_secret: str, state_secret: str) -> None:
         session = self.sessions.pop(model_secret, None)
         self.state_sessions.pop(state_secret, None)
         if session is not None:
@@ -184,6 +184,8 @@ class InterceptionServer(Interception):
             # (aiohttp keeps them alive past client death) so a slow upstream call
             # can't commit a late turn onto the concluded trace.
             session.release()
+            if session.client is not None:
+                await session.client.release_session(session.trace.id)
 
     @asynccontextmanager
     async def acquire(self, session: RolloutSession) -> AsyncIterator[Slot]:
@@ -191,7 +193,7 @@ class InterceptionServer(Interception):
         try:
             yield self.base_url, model_secret, state_secret
         finally:
-            self.unregister(model_secret, state_secret)
+            await self.unregister(model_secret, state_secret)
 
     def _handler_for(self, dialect: Dialect):
         """Bind a route's dialect to the request handler — the route the SDK posts to is what

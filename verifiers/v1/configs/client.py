@@ -71,6 +71,13 @@ class TrainClientConfig(BaseClientConfig):
     `TrainClient`), so responses carry token ids + logprobs. Needs a running vLLM engine."""
 
     type: Literal["train"] = "train"
+    inference_read_timeout_seconds: float | None = Field(
+        None,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    """Optional response-read timeout for one request to the training inference endpoint.
+    `None` preserves the library's default timeout unchanged."""
     renderer: RendererConfig | None = None
     """The `renderers.RendererConfig` to use (the same shared type prime-rl configures).
     `None` auto-resolves from the model — which falls back to the default renderer (no

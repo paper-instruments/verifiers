@@ -330,7 +330,16 @@ class TrainClient(Client):
 
     def __init__(self, config: TrainClientConfig) -> None:
         self.config = config
-        self.client = build_async_openai(config)
+        inference_timeout = DEFAULT_TIMEOUT
+
+        if config.inference_read_timeout_seconds is not None:
+            inference_timeout = httpx.Timeout(
+                connect=DEFAULT_TIMEOUT.connect,
+                read=config.inference_read_timeout_seconds,
+                write=DEFAULT_TIMEOUT.write,
+                pool=DEFAULT_TIMEOUT.pool,
+            )
+        self.client = build_async_openai(config, timeout=inference_timeout)
         self.release_client = (
             httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, limits=DEFAULT_LIMITS)
             if config.session_release_path is not None
@@ -471,14 +480,26 @@ class TrainClient(Client):
             except RendererOverlongPromptError as e:
                 raise OverlongPromptError(str(e)) from e
             except APITimeoutError as e:
+                elapsed = time.monotonic() - started
                 logger.warning(
                     "inference attempt failed failure_kind=client_timeout "
-                    "elapsed_seconds=%.3f timeout_phase=%s %s",
-                    time.monotonic() - started,
+                    "elapsed_seconds=%.3f read_timeout_seconds=%s "
+                    "timeout_phase=%s %s",
+                    elapsed,
+                    self.client.timeout.read,
                     type(e.__cause__).__name__ if e.__cause__ else "unknown",
                     attempt_context,
                 )
-                raise model_error(e) from e
+                raise model_error(
+                    "Inference request timed out: "
+                    "owner=verifiers.train_client "
+                    f"read_timeout_seconds={self.client.timeout.read} "
+                    f"elapsed_seconds={elapsed:.3f} "
+                    "http_status=504 "
+                    f"session_id={session_id or 'unknown'} "
+                    f"endpoint={self.config.base_url}",
+                    status_code=504,
+                ) from e
             except APIStatusError as e:
                 if e.status_code == 504:
                     logger.warning(

@@ -330,16 +330,15 @@ class TrainClient(Client):
 
     def __init__(self, config: TrainClientConfig) -> None:
         self.config = config
-        inference_timeout = (
-            DEFAULT_TIMEOUT
-            if config.inference_read_timeout_seconds is None
-            else httpx.Timeout(
+        inference_timeout = DEFAULT_TIMEOUT
+
+        if config.inference_read_timeout_seconds is not None:
+            inference_timeout = httpx.Timeout(
                 connect=DEFAULT_TIMEOUT.connect,
                 read=config.inference_read_timeout_seconds,
                 write=DEFAULT_TIMEOUT.write,
                 pool=DEFAULT_TIMEOUT.pool,
             )
-        )
         self.client = build_async_openai(config, timeout=inference_timeout)
         self.release_client = (
             httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, limits=DEFAULT_LIMITS)

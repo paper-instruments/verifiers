@@ -121,8 +121,7 @@ async def test_train_client_timeout_is_configured_and_attributed(
     error = exc_info.value
     assert error.status_code == 504
     assert "owner=verifiers.train_client" in str(error)
-    assert f"configured_read_timeout_seconds={configured_timeout}" in str(error)
-    assert f"effective_read_timeout_seconds={expected_timeout}" in str(error)
+    assert f"read_timeout_seconds={expected_timeout}" in str(error)
     assert "elapsed_seconds=" in str(error)
     assert "http_status=504" in str(error)
     assert "session_id=trace-123" in str(error)

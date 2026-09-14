@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from verifiers.v1.dialects import Dialect
 from verifiers.v1.graph import PendingTurn
-from verifiers.v1.types import Response, Sampling, SamplingConfig
+from verifiers.v1.types import Messages, Response, Sampling, SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,14 @@ class RelayReply:
 
 
 class Client(ABC):
+    def canonicalize_prompt(self, prompt: Messages) -> Messages:
+        """Return the model-format ordering used for graph preparation and inference.
+
+        Implementations may return a reordered copy when their model protocol defines a
+        canonical message order. They must not mutate ``prompt`` or its messages.
+        """
+        return prompt
+
     @abstractmethod
     async def get_response(
         self,

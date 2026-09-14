@@ -405,7 +405,6 @@ class InterceptionServer(Interception):
                             status=400,
                         )
                     return serve(response)
-                turn = graph.prepare_turn(session.trace, prompt)
                 session.error = None
                 upstream_request: dict | None = None
                 call_response: Response | None = None
@@ -414,6 +413,10 @@ class InterceptionServer(Interception):
                 started = time.time()
                 try:
                     try:
+                        canonical_prompt = session.ctx.client.canonicalize_prompt(
+                            prompt
+                        )
+                        turn = graph.prepare_turn(session.trace, canonical_prompt)
                         # What actually goes upstream: the native body with the rollout's model +
                         # sampling imposed — recorded raw on the trace, per call.
                         upstream_request = dialect.apply_overrides(

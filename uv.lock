@@ -1,12 +1,12 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and sys_platform == 'win32'",
     "python_full_version >= '3.13' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
     "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and sys_platform == 'win32'",
     "python_full_version < '3.12' and sys_platform == 'emscripten'",
@@ -18,12 +18,12 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
-prime-tunnel = false
-prime-sandboxes = false
 prime-pydantic-config = false
-ty = "2026-07-27T22:00:00Z"
+prime-sandboxes = false
+prime-tunnel = false
 renderers = false
-ruff = "2026-07-27T22:00:00Z"
+ruff = "2026-07-28T00:00:00Z"
+ty = "2026-07-28T00:00:00Z"
 
 [[package]]
 name = "aiofile"
@@ -159,12 +159,6 @@ name = "alphabet-sort-v1"
 version = "0.1.0"
 source = { editable = "environments/alphabet_sort_v1" }
 dependencies = [
-    { name = "datasets" },
-    { name = "verifiers" },
-]
-
-[package.metadata]
-requires-dist = [
     { name = "datasets" },
     { name = "verifiers" },
 ]
@@ -716,21 +710,12 @@ dependencies = [
     { name = "verifiers" },
 ]
 
-[package.metadata]
-requires-dist = [{ name = "verifiers" }]
-
 [[package]]
 name = "color-codeword-v1"
 version = "0.1.0"
 source = { editable = "environments/color_codeword_v1" }
 dependencies = [
     { name = "pillow" },
-    { name = "verifiers" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "pillow", specifier = ">=11.0.0" },
     { name = "verifiers" },
 ]
 
@@ -750,9 +735,6 @@ source = { editable = "environments/compact" }
 dependencies = [
     { name = "verifiers" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "verifiers" }]
 
 [[package]]
 name = "connect-python"
@@ -987,9 +969,6 @@ source = { editable = "environments/deepwiki_v1" }
 dependencies = [
     { name = "verifiers" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "verifiers" }]
 
 [[package]]
 name = "defusedxml"
@@ -1394,9 +1373,6 @@ dependencies = [
     { name = "verifiers" },
 ]
 
-[package.metadata]
-requires-dist = [{ name = "verifiers" }]
-
 [[package]]
 name = "googleapis-common-protos"
 version = "1.75.0"
@@ -1544,9 +1520,6 @@ source = { editable = "environments/gsm8k_v1" }
 dependencies = [
     { name = "datasets" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "datasets" }]
 
 [[package]]
 name = "h11"
@@ -2105,9 +2078,6 @@ dependencies = [
     { name = "verifiers" },
 ]
 
-[package.metadata]
-requires-dist = [{ name = "verifiers" }]
-
 [[package]]
 name = "latex2sympy2-extended"
 version = "1.11.0"
@@ -2586,7 +2556,7 @@ wheels = [
 
 [[package]]
 name = "nltk"
-version = "3.10.0"
+version = "3.10.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -2595,9 +2565,9 @@ dependencies = [
     { name = "regex" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/96/02/df4f105b28a7c16b0e41423bc09cf0f1b8a305df4ef0b10ca74a2e4c648c/nltk-3.10.0.tar.gz", hash = "sha256:4fbac1d98203cbcd1b5d94a2877fb822300072d80604a5e7fae49d2c5f84e8c1", size = 3089244, upload-time = "2026-07-08T02:39:13.562Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3a/cb/bbaa9be58e95d21729c6b9194376610230e0755f6de0bf38b6acc0dce079/nltk-3.10.4.tar.gz", hash = "sha256:44679f4e9220abfd496d2c8cdb22f8425ccbe557604f9aa5cacb1c44003dabc1", size = 4300570, upload-time = "2026-10-21T11:34:35.851Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6e/89/a0b0f35e2820d6a99d75ea1c11977ee6d5c9e6658eceb45b0c7620881faa/nltk-3.10.0-py3-none-any.whl", hash = "sha256:54ff84d4916d3ef127e8953bee0023f6a6b320b75d634a19e06ef056d3d244bf", size = 1716144, upload-time = "2026-07-08T02:39:09.753Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/04/e7816813e409ca874ba2fcc35455db0e4130b79eb277e1f9edd270ca3c69/nltk-3.10.4-py3-none-any.whl", hash = "sha256:769ba5413f265b7d3e87cd163cc28efa01e29eeef8bb6080bc907949d9fcfb51", size = 1722994, upload-time = "2026-10-21T11:34:27.975Z" },
 ]
 
 [[package]]
@@ -2678,10 +2648,10 @@ version = "2.5.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and sys_platform == 'win32'",
     "python_full_version >= '3.13' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
     "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/22/fd/89965aa4ac08c74998539fcbf24fa3540f3e15237fbeb6bcf9c908f4aade/numpy-2.5.1.tar.gz", hash = "sha256:a48a113e6afea91f5608793bafa7ef2ad481fefbda87ec5069f483de61cb9fa3", size = 20755553, upload-time = "2026-07-04T17:08:00.933Z" }
@@ -2856,9 +2826,6 @@ source = { editable = "environments/openenv_wordle_v1" }
 dependencies = [
     { name = "verifiers", extra = ["openenv"] },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "verifiers", extras = ["openenv"] }]
 
 [[package]]
 name = "opentelemetry-api"
@@ -3299,9 +3266,6 @@ source = { editable = "environments/proposer_solver_v1" }
 dependencies = [
     { name = "verifiers" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "verifiers" }]
 
 [[package]]
 name = "protobuf"
@@ -4105,9 +4069,6 @@ dependencies = [
     { name = "datasets" },
 ]
 
-[package.metadata]
-requires-dist = [{ name = "datasets" }]
-
 [[package]]
 name = "rich"
 version = "15.0.0"
@@ -4280,9 +4241,6 @@ source = { editable = "environments/scratchpad_v1" }
 dependencies = [
     { name = "verifiers" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "verifiers" }]
 
 [[package]]
 name = "secretstorage"
@@ -4889,6 +4847,7 @@ wheels = [
 [[package]]
 name = "verifiers"
 source = { editable = "." }
+default-groups = ["dev", "examples"]
 dependencies = [
     { name = "aiohttp" },
     { name = "aiolimiter" },
@@ -4975,79 +4934,6 @@ examples = [
     { name = "scratchpad-v1" },
     { name = "wiki-search-v1" },
     { name = "wordle-v1" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9.0" },
-    { name = "aiolimiter", specifier = ">=1.2.1" },
-    { name = "anthropic", specifier = ">=0.78.0" },
-    { name = "datasets", specifier = ">=3.3.0,<6.0.0" },
-    { name = "gepa", specifier = ">=0.0.6" },
-    { name = "harbor", marker = "python_full_version >= '3.12' and extra == 'harbor'", specifier = "==0.14.0" },
-    { name = "httpx", specifier = ">=0.27.0" },
-    { name = "loguru", specifier = ">=0.7.0" },
-    { name = "math-verify", specifier = ">=0.8.0" },
-    { name = "mcp", specifier = ">=1.24.0,<2" },
-    { name = "modal", marker = "extra == 'modal'", specifier = ">=1.4.0" },
-    { name = "msgpack", specifier = ">=1.1.2" },
-    { name = "nest-asyncio", marker = "extra == 'notebook'", specifier = ">=1.6.0" },
-    { name = "nltk", marker = "extra == 'ta'", specifier = ">=3.9.2" },
-    { name = "numpy", specifier = ">=2.1.0" },
-    { name = "openai", specifier = ">=2.9.0" },
-    { name = "openai-agents", specifier = ">=0.8.2" },
-    { name = "openenv", marker = "extra == 'openenv'", specifier = ">=0.4.1" },
-    { name = "prime-pydantic-config", extras = ["toml"], specifier = ">=0.4.2" },
-    { name = "prime-sandboxes", specifier = ">=0.2.33" },
-    { name = "prime-tunnel", specifier = ">=0.1.8" },
-    { name = "pydantic", specifier = ">=2.12.3" },
-    { name = "python-dotenv", marker = "extra == 'browser'", specifier = ">=1.0.0" },
-    { name = "pyzmq", specifier = ">=27.1.0" },
-    { name = "reasoning-gym", marker = "extra == 'rg'", specifier = ">=0.1.8" },
-    { name = "renderers", specifier = ">=0.1.8" },
-    { name = "requests" },
-    { name = "rich", specifier = ">=11.0.0" },
-    { name = "setproctitle", specifier = ">=1.3.0" },
-    { name = "stagehand", marker = "extra == 'browser'", specifier = ">=3.4.0" },
-    { name = "tenacity", specifier = ">=8.5.0" },
-    { name = "textarena", marker = "extra == 'ta'", specifier = "==0.7.4" },
-    { name = "tomli-w", specifier = ">=1.0.0" },
-    { name = "typing-extensions", specifier = ">=4.12.2" },
-    { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'", specifier = ">=0.21.0" },
-]
-provides-extras = ["browser", "harbor", "modal", "notebook", "openenv", "rg", "ta"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "nest-asyncio", specifier = ">=1.6.0" },
-    { name = "nltk", specifier = ">=3.9.2" },
-    { name = "pre-commit", specifier = ">=2.19.0" },
-    { name = "pytest", specifier = ">=7.0.0,<9.1.0" },
-    { name = "pytest-asyncio", specifier = ">=0.21.0" },
-    { name = "pytest-cov", specifier = ">=4.0.0" },
-    { name = "pytest-xdist", specifier = ">=3.8.0" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
-    { name = "reasoning-gym", specifier = ">=0.1.8" },
-    { name = "ruff", specifier = ">=0.16.0" },
-    { name = "stagehand", specifier = ">=3.4.0" },
-    { name = "textarena", specifier = "==0.7.4" },
-    { name = "ty", specifier = ">=0.0.63" },
-]
-examples = [
-    { name = "alphabet-sort-v1", editable = "environments/alphabet_sort_v1" },
-    { name = "code-golf-v1", editable = "environments/code_golf_v1" },
-    { name = "color-codeword-v1", editable = "environments/color_codeword_v1" },
-    { name = "compact", editable = "environments/compact" },
-    { name = "deepwiki-v1", editable = "environments/deepwiki_v1" },
-    { name = "glossary-v1", editable = "environments/glossary_v1" },
-    { name = "gsm8k-v1", editable = "environments/gsm8k_v1" },
-    { name = "kuhn-poker-v1", editable = "environments/kuhn_poker_v1" },
-    { name = "openenv-wordle-v1", editable = "environments/openenv_wordle_v1" },
-    { name = "proposer-solver-v1", editable = "environments/proposer_solver_v1" },
-    { name = "reverse-text-v1", editable = "environments/reverse_text_v1" },
-    { name = "scratchpad-v1", editable = "environments/scratchpad_v1" },
-    { name = "wiki-search-v1", editable = "environments/wiki_search_v1" },
-    { name = "wordle-v1", editable = "environments/wordle_v1" },
 ]
 
 [[package]]
@@ -5194,13 +5080,6 @@ dependencies = [
     { name = "verifiers" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "chromadb", specifier = ">=0.4.13" },
-    { name = "datasets" },
-    { name = "verifiers" },
-]
-
 [[package]]
 name = "win32-setctime"
 version = "1.2.0"
@@ -5217,9 +5096,6 @@ source = { editable = "environments/wordle_v1" }
 dependencies = [
     { name = "verifiers", extra = ["ta"] },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "verifiers", extras = ["ta"] }]
 
 [[package]]
 name = "xxhash"
